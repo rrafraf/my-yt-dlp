@@ -1,0 +1,16 @@
+# Cache folders
+cache/
+**/cache/
+.cache/
+__pycache__/
+
+# ffmpeg
+ffmpeg/
+**/ffmpeg/
+ffmpeg_yt-dlp/
+
+# Executables
+*.exe
+
+# Archives
+*.zip 
