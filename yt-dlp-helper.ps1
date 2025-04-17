@@ -1,6 +1,255 @@
 #Requires -Version 5.0
 param()
 
+# --- START Preference Handling ---
+$userPrefsFile = Join-Path -Path $PSScriptRoot -ChildPath "user_preferences.json"
+$script:currentYtDlpVersion = $null # Stores the version tag of the current yt-dlp.exe
+$script:lastChoice = $null # Keep existing preference
+$script:lastPlaylistIndex = $null # Keep existing preference
+$script:lastPlaylistId = $null # Keep existing preference
+
+# Function to save user preferences
+function Save-UserPreferences {
+    [CmdletBinding()]
+    param(
+        [string]$menuChoice = $script:lastChoice,
+        [string]$playlistIndex = $script:lastPlaylistIndex,
+        [string]$playlistId = $script:lastPlaylistId,
+        [string]$ytDlpVersion = $script:currentYtDlpVersion # Use current script value if not passed
+    )
+    
+    # Update script variables before saving
+    $script:lastChoice = $menuChoice
+    $script:lastPlaylistIndex = $playlistIndex
+    $script:lastPlaylistId = $playlistId
+    $script:currentYtDlpVersion = $ytDlpVersion
+
+    $preferences = @{
+        lastMenuChoice = $script:lastChoice
+        lastPlaylistIndex = $script:lastPlaylistIndex
+        lastPlaylistId = $script:lastPlaylistId
+        currentYtDlpVersion = $script:currentYtDlpVersion # Save the version
+    }
+    
+    try {
+        $preferences | ConvertTo-Json -Depth 5 | Set-Content -Path $userPrefsFile -Encoding UTF8 -Force
+    } catch {
+        Write-Warning "Could not save preferences to '$userPrefsFile': $($_.Exception.Message)"
+    }
+}
+
+# Function to load user preferences
+function Load-UserPreferences {
+    if (Test-Path $userPrefsFile) {
+        try {
+            $userPrefs = Get-Content -Path $userPrefsFile -Raw | ConvertFrom-Json -ErrorAction Stop
+            
+            if ($userPrefs.PSObject.Properties.Name -contains 'lastMenuChoice') { $script:lastChoice = $userPrefs.lastMenuChoice }
+            if ($userPrefs.PSObject.Properties.Name -contains 'lastPlaylistIndex') { $script:lastPlaylistIndex = $userPrefs.lastPlaylistIndex }
+            if ($userPrefs.PSObject.Properties.Name -contains 'lastPlaylistId') { $script:lastPlaylistId = $userPrefs.lastPlaylistId }
+            if ($userPrefs.PSObject.Properties.Name -contains 'currentYtDlpVersion') { $script:currentYtDlpVersion = $userPrefs.currentYtDlpVersion }
+
+            Write-Host "Loaded preferences: YT-DLP Ver: $($script:currentYtDlpVersion), Last Choice: $($script:lastChoice), Last Playlist: $($script:lastPlaylistIndex)" -ForegroundColor DarkGray
+        } catch {
+            Write-Warning "Could not load or parse user preferences from '$userPrefsFile': $($_.Exception.Message). Using defaults."
+        }
+    } else {
+        Write-Host "Preference file '$userPrefsFile' not found. Using defaults." -ForegroundColor DarkGray
+    }
+}
+# --- END Preference Handling ---
+
+
+# --- START YT-DLP Nightly Update Check ---
+
+# Function to get yt-dlp.exe version
+function Get-LocalYtDlpVersion {
+    param([string]$ExePath)
+    if (-not (Test-Path $ExePath -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = $ExePath
+        $processInfo.Arguments = '--version'
+        $processInfo.UseShellExecute = $false
+        $processInfo.RedirectStandardOutput = $true
+        $processInfo.RedirectStandardError = $true
+        $processInfo.CreateNoWindow = $true
+        
+        $process = [System.Diagnostics.Process]::Start($processInfo)
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+
+        # Match standard YYYY.MM.DD or nightly YYYY.MM.DD.timestamp
+        if ($exitCode -eq 0 -and $stdout -match '^\d{4}\.\d{2}\.\d{2}(?:\.\d{6})?') {
+            return $matches[0]
+        } else {
+            Write-Warning "Could not get version from '$ExePath'. Exit Code: $exitCode Stdout: '$stdout' Stderr: '$stderr'"
+            return $null
+        }
+    } catch {
+        Write-Warning "Error running '$ExePath --version': $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Function to check for nightly updates and download if necessary
+function Check-YtDlpNightlyUpdate {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$ExpectedExePath, # Path where yt-dlp.exe should be
+
+        [Parameter(Mandatory=$true)]
+        [ref]$ScriptVersionRef, # Reference to update $script:currentYtDlpVersion
+        
+        [Parameter(Mandatory=$true)]
+        [ref]$ResolvedExePathRef # Outputs the final path if successful
+    )
+    
+    Write-Host "--- Checking YT-DLP Nightly Build ---" -ForegroundColor Magenta
+    $ResolvedExePathRef.Value = $null # Reset output path
+    $localVersion = $null
+    $exeExists = Test-Path $ExpectedExePath -PathType Leaf
+    $nightlyApiUrl = "https://api.github.com/repos/yt-dlp/yt-dlp-nightly-builds/releases/latest"
+
+    # 1. Determine Local Version
+    if ($exeExists) {
+        $localVersion = Get-LocalYtDlpVersion -ExePath $ExpectedExePath
+        if (-not $localVersion -and $ScriptVersionRef.Value) {
+             Write-Host "Could not run '$ExpectedExePath --version'. Using stored version: $($ScriptVersionRef.Value)" -ForegroundColor Yellow
+             $localVersion = $ScriptVersionRef.Value
+        } elseif ($localVersion -and $localVersion -ne $ScriptVersionRef.Value) {
+             Write-Host "Executable version ($localVersion) differs from stored version ($($ScriptVersionRef.Value)). Updating stored version." -ForegroundColor Yellow
+             $ScriptVersionRef.Value = $localVersion
+             Save-UserPreferences -ytDlpVersion $localVersion
+        }
+        $ResolvedExePathRef.Value = $ExpectedExePath # Mark as found locally for now
+    } else {
+         Write-Host "yt-dlp.exe not found at '$ExpectedExePath'." -ForegroundColor Yellow
+    }
+
+    # 2. Check GitHub for Latest Nightly Version
+    Write-Host "Checking GitHub for latest nightly release... ($nightlyApiUrl)" -ForegroundColor Cyan
+    $latestRelease = $null
+    try {
+        $latestRelease = Invoke-RestMethod -Uri $nightlyApiUrl -UseBasicParsing -TimeoutSec 15
+    } catch {
+        Write-Warning "Failed to fetch latest nightly release info from GitHub: $($_.Exception.Message)"
+        if ($exeExists) {
+             Write-Host "Proceeding with existing local yt-dlp.exe (version: $(if ($localVersion) { $localVersion } else { 'unknown' }))" -ForegroundColor Yellow
+             return $true # Indicate we can proceed (with the local version)
+        } else {
+            Write-Error "Cannot check for updates and local yt-dlp.exe is missing."
+            return $false # Indicate we cannot proceed
+        }
+    }
+
+    $latestVersion = $latestRelease.tag_name
+    if ($latestVersion -like 'v*') { $latestVersion = $latestVersion.Substring(1) }
+    Write-Host "Latest nightly version available: $latestVersion" -ForegroundColor Green
+
+    # 3. Compare Versions and Decide if Update Needed
+    $updateNeeded = $false
+    if (-not $exeExists) {
+        Write-Host "Local yt-dlp.exe missing. Update required." -ForegroundColor Yellow
+        $updateNeeded = $true
+    } elseif (-not $localVersion) {
+         Write-Host "Could not determine local version. Assuming update is needed." -ForegroundColor Yellow
+         $updateNeeded = $true
+    } elseif ($latestVersion -gt $localVersion) { # String comparison works for YYYY.MM.DD[.timestamp]
+        Write-Host "Newer nightly version available ($latestVersion > $localVersion). Update recommended." -ForegroundColor Yellow
+        $updateNeeded = $true
+    } else {
+        Write-Host "You have the latest nightly version ($localVersion)." -ForegroundColor Green
+        if ($localVersion -and $ScriptVersionRef.Value -ne $localVersion) {
+             $ScriptVersionRef.Value = $localVersion
+             Save-UserPreferences -ytDlpVersion $localVersion
+        }
+        return $true # Indicate we can proceed (with the up-to-date local version)
+    }
+
+    # 4. Download Update if Needed
+    if ($updateNeeded) {
+        $assetName = "yt-dlp.exe"
+        $asset = $latestRelease.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+
+        if (-not $asset) {
+            Write-Error "No asset named '$assetName' found in the latest nightly release."
+            if ($exeExists) {
+                 Write-Host "Proceeding with existing local yt-dlp.exe (version: $(if ($localVersion) { $localVersion } else { 'unknown' }))" -ForegroundColor Yellow
+                 return $true
+            } else {
+                return $false
+            }
+        }
+
+        Write-Host "Downloading $($asset.name) (Version: $latestVersion)... -> $ExpectedExePath" -ForegroundColor Cyan
+        $downloadUrl = $asset.browser_download_url
+        try {
+            if (Test-Path $ExpectedExePath) {
+                try {
+                    $fileStream = [System.IO.File]::Open($ExpectedExePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+                    $fileStream.Close(); $fileStream.Dispose()
+                } catch [System.IO.IOException] {
+                    Write-Warning "Could not get write access to '$ExpectedExePath'. It might be in use. Skipping update."
+                    if ($exeExists) { return $true }
+                    else { return $false }
+                } catch { Write-Warning "Error checking file lock: $($_.Exception.Message)" }
+            }
+            
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $ExpectedExePath -UseBasicParsing -ErrorAction Stop
+            Write-Host "Download complete."-ForegroundColor Green
+
+            $newVersion = Get-LocalYtDlpVersion -ExePath $ExpectedExePath
+            if ($newVersion) {
+                $ScriptVersionRef.Value = $newVersion # Should match latestVersion ideally
+                $ResolvedExePathRef.Value = $ExpectedExePath
+                Save-UserPreferences -ytDlpVersion $newVersion
+                Write-Host "Successfully updated yt-dlp to nightly version $newVersion." -ForegroundColor Green
+                return $true
+            } else {
+                 Write-Error "Downloaded file '$ExpectedExePath' but failed to execute or get version."
+                 if (Test-Path $ExpectedExePath) { Remove-Item $ExpectedExePath -ErrorAction SilentlyContinue }
+                 return $false
+            }
+        } catch {
+            Write-Error "Failed to download '$($asset.name)' from '$downloadUrl': $($_.Exception.Message)"
+            if ($exeExists) {
+                Write-Host "Proceeding with existing local yt-dlp.exe." -ForegroundColor Yellow
+                return $true
+            } else {
+                return $false
+            }
+        }
+    }
+    
+    # Fallback
+    if ($exeExists) { return $true } else { return $false }
+}
+
+# --- END YT-DLP Nightly Update Check ---
+
+# --- Script Main Execution Start ---
+Load-UserPreferences # Load preferences first
+
+Write-Host "Starting yt-dlp Helper Script..."
+
+$expectedYtDlpExePath = Join-Path $PSScriptRoot "yt-dlp.exe"
+$ytDlpExePath = $null # Will be set by the update check
+
+# Run the update check
+$updateCheckSuccess = Check-YtDlpNightlyUpdate -ExpectedExePath $expectedYtDlpExePath -ScriptVersionRef ([ref]$script:currentYtDlpVersion) -ResolvedExePathRef ([ref]$ytDlpExePath)
+
+if (-not $updateCheckSuccess -or -not $ytDlpExePath) {
+    Write-Error "Halting script: Failed to find or update yt-dlp.exe."
+    exit 1
+}
+
+Write-Host "==> Using YT-DLP Version: $($script:currentYtDlpVersion) | Path: $ytDlpExePath <==" -ForegroundColor White -BackgroundColor DarkBlue
+
 # --- FFmpeg Setup Logic ---
 
 # Define paths and constants
@@ -597,7 +846,6 @@ function List-And-Download-My-Playlists {
     }
 }
 
-
 # --- Script Main Execution ---
 
 # Path for saved user preferences
@@ -659,7 +907,6 @@ if (-not (Test-Path $ytDlpExePath -PathType Leaf)) {
     exit 1
 }
 Write-Host "Found yt-dlp.exe at: $ytDlpExePath" -ForegroundColor Green
-
 
 # --- FFmpeg Setup Logic --- 
 # ... (FFmpeg setup logic uses $PSScriptRoot for its paths)
