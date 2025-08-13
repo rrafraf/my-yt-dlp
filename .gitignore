@@ -13,18 +13,12 @@ ffmpeg_yt-dlp/
 Downloads/
 download_archive.txt
 
-# Cache files
-# cache/playlists_cache.json
-!cache/playlists_cache.json
-
-# Explicitly include user_preferences.json if any rule would ignore it
-!user_preferences.json
-
 # Executables
 *.exe
 
 # Archives
 *.zip 
+
 user_preferences.json
 cache/playlists_cache.json
 _tbt_audios/
