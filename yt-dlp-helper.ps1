@@ -302,10 +302,58 @@ $defaultRoot = if ($script:downloadRootPath) { $script:downloadRootPath } else {
 $treatWarningsDefault = if ($TreatYtDlpErrorsAsWarnings) { $true } else { $script:treatYtDlpErrorsAsWarningsPref }
 $enteredRoot = Read-Host "Enter download root directory (press Enter to use last/default): [$defaultRoot]"
 if ([string]::IsNullOrWhiteSpace($enteredRoot)) { $enteredRoot = $defaultRoot }
-$script:downloadRootPath = $enteredRoot
 
-# Ensure directory exists
-if (-not (Test-Path $script:downloadRootPath -PathType Container)) {
+# Validate and resolve the entered root
+$selectedRoot = $enteredRoot
+$fallbackUsed = $false
+$fallbackReason = $null
+
+# Check invalid characters
+$invalidChars = [System.IO.Path]::GetInvalidPathChars()
+if ($selectedRoot.IndexOfAny($invalidChars) -ge 0) {
+    $fallbackUsed = $true
+    $fallbackReason = "contains invalid path characters"
+    $selectedRoot = $defaultRoot
+}
+
+# Resolve relative paths against script root
+if (-not $fallbackUsed) {
+    if (-not [System.IO.Path]::IsPathRooted($selectedRoot)) {
+        $selectedRoot = Join-Path -Path $PSScriptRoot -ChildPath $selectedRoot
+    }
+}
+
+# Ensure directory exists and is accessible; if creation fails, fallback
+if (-not $fallbackUsed) {
+    if (-not (Test-Path $selectedRoot -PathType Container)) {
+        try {
+            New-Item -ItemType Directory -Path $selectedRoot -Force -ErrorAction Stop | Out-Null
+            Write-Host "Created download root: $selectedRoot"
+        } catch {
+            $fallbackUsed = $true
+            $fallbackReason = "failed to create directory ($($_.Exception.Message))"
+            $selectedRoot = $defaultRoot
+        }
+    }
+}
+
+# Final check: ensure the selectedRoot is a directory
+if (-not $fallbackUsed) {
+    if (-not (Test-Path $selectedRoot -PathType Container)) {
+        $fallbackUsed = $true
+        $fallbackReason = "path is not a directory or not accessible"
+        $selectedRoot = $defaultRoot
+    }
+}
+
+if ($fallbackUsed -and ($selectedRoot -ne $enteredRoot)) {
+    Write-Warning "The entered download root '$enteredRoot' is invalid: $fallbackReason. Using default/previous root: '$selectedRoot'."
+}
+
+$script:downloadRootPath = $selectedRoot
+
+# If we fell back to the default/previous root and it doesn't exist yet, ensure it is created
+if ($fallbackUsed -and -not (Test-Path $script:downloadRootPath -PathType Container)) {
     try {
         New-Item -ItemType Directory -Path $script:downloadRootPath -Force -ErrorAction Stop | Out-Null
         Write-Host "Created download root: $($script:downloadRootPath)"
@@ -315,8 +363,8 @@ if (-not (Test-Path $script:downloadRootPath -PathType Container)) {
     }
 }
 
-# Reload per-root preferences for the chosen root
-Load-UserPreferences
+# Always confirm the final chosen download root
+Write-Host "Using download root: $($script:downloadRootPath)" -ForegroundColor Cyan
 
 # If user didn't explicitly pass the switch, use saved preference
 if (-not $TreatYtDlpErrorsAsWarnings -and $treatWarningsDefault) {
@@ -440,20 +488,39 @@ if ($absoluteFfmpegBinPath) {
 
 # --- Authentication Setup --- 
 # Hardcoding authentication using the full profile PATH
-$firefoxProfilePath = 'C:\Users\gentl\AppData\Roaming\Mozilla\Firefox\Profiles\fw0m6kre.default-nightly' # !!! UPDATED WITH USER PATH !!!
+$firefoxProfilePath = "$env:USERPROFILE\AppData\Roaming\Mozilla\Firefox\Profiles\fw0m6kre.default-nightly" # !!! UPDATED WITH USER PATH !!!
 
-if (-not (Test-Path $firefoxProfilePath -PathType Container)) {
-    Write-Error "FATAL: The specified Firefox profile path does not exist: $firefoxProfilePath"
-    Write-Error "Please correct the path in the script (line starting with `$firefoxProfilePath =`). You can find it in Firefox Nightly at about:profiles."
-    exit 1
+# Determine whether authentication via Firefox cookies is available
+$script:authAvailable = $false
+$authType = $null
+$authValue = $null
+
+$authStatusMessage = $null
+if ([string]::IsNullOrWhiteSpace($firefoxProfilePath)) {
+    $authStatusMessage = 'profile path is empty or not set'
+} elseif (-not (Test-Path $firefoxProfilePath -PathType Container)) {
+    $authStatusMessage = "profile path does not exist: $firefoxProfilePath"
+} else {
+    try {
+        # Check accessibility and that the directory is not empty
+        $items = Get-ChildItem -Path $firefoxProfilePath -Force -ErrorAction Stop
+        if ($items.Count -gt 0) {
+            $profileFolderName = Split-Path -Leaf $firefoxProfilePath
+            $authType = 'cookies_browser'
+            $authValue = "firefox:$profileFolderName"
+            $script:authAvailable = $true
+            Write-Host "Using authentication: $authType with value $authValue" -ForegroundColor Yellow
+        } else {
+            $authStatusMessage = "profile path exists but is empty: $firefoxProfilePath"
+        }
+    } catch {
+        $authStatusMessage = "profile path is not accessible: $($_.Exception.Message)"
+    }
 }
 
-# Extract just the profile folder name without the full path
-$profileFolderName = Split-Path -Leaf $firefoxProfilePath
-# Format as "firefox:profilename" for yt-dlp
-$authType = 'cookies_browser' 
-$authValue = "firefox:$profileFolderName" 
-Write-Host "Using authentication: $authType with value $authValue" -ForegroundColor Yellow
+if (-not $script:authAvailable) {
+    Write-Warning "No Firefox profile available for YouTube authentication ($authStatusMessage). The script will use public-only features."
+}
 # --- End Authentication Setup ---
 
 # --- Download Functions ---
@@ -942,17 +1009,73 @@ function List-And-Download-My-Playlists {
 
 # --- Script Main Execution ---
 
+# Helper: read menu choice with Esc handling
+function Read-MenuInput {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)] [string]$Prompt,
+        [string]$Default
+    )
+    # Show prompt
+    Write-Host $Prompt -NoNewline
+    $builder = [System.Text.StringBuilder]::new()
+    $usedDefault = $false
+    while ($true) {
+        $keyInfo = [System.Console]::ReadKey($true)
+        switch ($keyInfo.Key) {
+            'Escape' {
+                Write-Host ""
+                return [pscustomobject]@{ Escaped = $true; Input = $null; UsedDefault = $false }
+            }
+            'Enter' {
+                Write-Host ""
+                $text = $builder.ToString()
+                if ([string]::IsNullOrWhiteSpace($text) -and -not [string]::IsNullOrWhiteSpace($Default)) {
+                    $text = $Default
+                    $usedDefault = $true
+                }
+                return [pscustomobject]@{ Escaped = $false; Input = $text; UsedDefault = $usedDefault }
+            }
+            'Backspace' {
+                if ($builder.Length -gt 0) {
+                    $builder.Length--
+                    Write-Host "`b `b" -NoNewline
+                }
+            }
+            Default {
+                if ($keyInfo.KeyChar) {
+                    [void]$builder.Append($keyInfo.KeyChar)
+                    Write-Host $keyInfo.KeyChar -NoNewline
+                }
+            }
+        }
+    }
+}
+
 Write-Host "`nPlease choose an action:" -ForegroundColor Green
 Write-Host "1. Download Single Video (Best Quality + Metadata)"
 Write-Host "2. Download Playlist by URL (Best Quality + Metadata)"
-Write-Host "3. List & Download My Playlist (Requires Auth)"
-Write-Host "4. List & Download My Playlist (Refresh Cache)"
+if ($script:authAvailable) {
+    Write-Host "3. List & Download My Playlist (Requires Auth)"
+    Write-Host "4. List & Download My Playlist (Refresh Cache)"
+} else {
+    Write-Host "3. List & Download My Playlist (Requires Auth) - Unavailable (missing Firefox profile)" -ForegroundColor DarkGray
+    Write-Host "4. List & Download My Playlist (Refresh Cache) - Unavailable (missing Firefox profile)" -ForegroundColor DarkGray
+}
 
 $defaultChoice = if ($script:lastChoice) { $script:lastChoice } else { "" }
-$choice = Read-Host "Enter your choice (1, 2, 3, or 4)$(if ($defaultChoice) { " [Last: $defaultChoice]" })"
+$menuPrompt = "Enter your choice (1, 2, 3, or 4)$(if ($defaultChoice) { " [Last: $defaultChoice]" }) (Esc to exit): "
+$menuInput = Read-MenuInput -Prompt $menuPrompt -Default $defaultChoice
+if ($menuInput.Escaped) {
+    Write-Host "Exiting by user request." -ForegroundColor Cyan
+    return
+}
+$choice = $menuInput.Input
 
 # If empty input and we have a default, use the default
-if ([string]::IsNullOrWhiteSpace($choice) -and $defaultChoice) {
+if ($menuInput.UsedDefault) {
+    Write-Host "Using last choice: $choice" -ForegroundColor DarkGray
+} elseif ([string]::IsNullOrWhiteSpace($choice) -and $defaultChoice) {
     $choice = $defaultChoice
     Write-Host "Using last choice: $choice" -ForegroundColor DarkGray
 }
@@ -975,10 +1098,18 @@ try {
             Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
         }
         "3" {
+            if (-not $script:authAvailable) {
+                Write-Warning "Option 3 is unavailable because a valid Firefox profile with YouTube cookies was not found. Running in public-only mode."
+                break
+            }
             Write-Host "Selected: List & Download My Playlist" -ForegroundColor Yellow
             List-And-Download-My-Playlists -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
         }
         "4" {
+            if (-not $script:authAvailable) {
+                Write-Warning "Option 4 is unavailable because a valid Firefox profile with YouTube cookies was not found. Running in public-only mode."
+                break
+            }
             Write-Host "Selected: List & Download My Playlist (Force Refresh Cache)" -ForegroundColor Yellow
             List-And-Download-My-Playlists -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -ForceRefreshCache -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
         }
