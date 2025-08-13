@@ -25,3 +25,7 @@ download_archive.txt
 
 # Archives
 *.zip 
+user_preferences.json
+cache/playlists_cache.json
+_tbt_audios/
+Transcripts/
