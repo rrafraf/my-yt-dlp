@@ -1,5 +1,34 @@
 #Requires -Version 5.0
-param()
+param(
+    [switch]$TreatYtDlpErrorsAsWarnings = $false  # If true, yt-dlp non-zero exit codes will be warnings instead of errors
+)
+
+<#
+.SYNOPSIS
+    yt-dlp Helper Script for YouTube Downloads with improved error handling
+
+.DESCRIPTION
+    This script provides a menu-driven interface for downloading YouTube videos and playlists using yt-dlp.
+    It includes automatic yt-dlp updates, FFmpeg setup, and robust error handling for unavailable videos.
+
+.PARAMETER TreatYtDlpErrorsAsWarnings
+    When specified, yt-dlp exit codes indicating failures (like unavailable videos) will be treated as warnings
+    instead of terminating errors. This allows the script to continue even when some videos in a playlist
+    are unavailable due to copyright claims, account termination, or regional restrictions.
+
+.EXAMPLE
+    .\yt-dlp-helper.ps1
+    Run the script normally - yt-dlp errors will cause the script to terminate
+
+.EXAMPLE
+    .\yt-dlp-helper.ps1 -TreatYtDlpErrorsAsWarnings
+    Run the script with graceful error handling - unavailable videos will generate warnings but won't stop the script
+
+.NOTES
+    The TreatYtDlpErrorsAsWarnings parameter is especially useful for large playlists where some videos
+    may become unavailable over time. Without this flag, encountering a single unavailable video would
+    stop the entire download process.
+#>
 
 # --- START Console Encoding ---
 try {
@@ -21,6 +50,7 @@ $script:lastPlaylistIndex = $null
 $script:lastPlaylistId = $null
 $script:downloadRootPath = $null
 $script:perRootPrefsFile = $null
+$script:treatYtDlpErrorsAsWarningsPref = $false
 
 # Function to save preferences (global only)
 function Save-UserPreferences {
@@ -52,6 +82,7 @@ function Save-UserPreferences {
         lastPlaylistId       = $script:lastPlaylistId
         currentYtDlpVersion  = $script:currentYtDlpVersion
         lastDownloadRootPath = $script:downloadRootPath
+        treatYtDlpErrorsAsWarningsPreferred = if ($TreatYtDlpErrorsAsWarnings) { $true } else { $script:treatYtDlpErrorsAsWarningsPref }
     }
     try {
         $globalPrefs | ConvertTo-Json -Depth 5 | Set-Content -Path $globalPrefsFile -Encoding UTF8 -Force
@@ -71,6 +102,7 @@ function Load-UserPreferences {
             if ($global.PSObject.Properties.Name -contains 'lastPlaylistId') { $script:lastPlaylistId = $global.lastPlaylistId }
             if ($global.PSObject.Properties.Name -contains 'currentYtDlpVersion') { $script:currentYtDlpVersion = $global.currentYtDlpVersion }
             if ($global.PSObject.Properties.Name -contains 'lastDownloadRootPath') { $script:downloadRootPath = $global.lastDownloadRootPath }
+            if ($global.PSObject.Properties.Name -contains 'treatYtDlpErrorsAsWarningsPreferred') { $script:treatYtDlpErrorsAsWarningsPref = [bool]$global.treatYtDlpErrorsAsWarningsPreferred }
         } catch {
             Write-Warning "Could not load or parse global preferences from '$globalPrefsFile': $($_.Exception.Message). Using defaults."
         }
@@ -267,6 +299,7 @@ Write-Host "Starting yt-dlp Helper Script..."
 
 # Prompt for or confirm Download Root (persist per-root and globally)
 $defaultRoot = if ($script:downloadRootPath) { $script:downloadRootPath } else { Join-Path $PSScriptRoot "Downloads" }
+$treatWarningsDefault = if ($TreatYtDlpErrorsAsWarnings) { $true } else { $script:treatYtDlpErrorsAsWarningsPref }
 $enteredRoot = Read-Host "Enter download root directory (press Enter to use last/default): [$defaultRoot]"
 if ([string]::IsNullOrWhiteSpace($enteredRoot)) { $enteredRoot = $defaultRoot }
 $script:downloadRootPath = $enteredRoot
@@ -284,6 +317,14 @@ if (-not (Test-Path $script:downloadRootPath -PathType Container)) {
 
 # Reload per-root preferences for the chosen root
 Load-UserPreferences
+
+# If user didn't explicitly pass the switch, use saved preference
+if (-not $TreatYtDlpErrorsAsWarnings -and $treatWarningsDefault) {
+    Write-Host "Using saved preference: Treat yt-dlp errors as warnings." -ForegroundColor DarkYellow
+    $script:useWarningsForYtDlp = $true
+} else {
+    $script:useWarningsForYtDlp = [bool]$TreatYtDlpErrorsAsWarnings
+}
 
 # Save immediately so per-root prefs file is established
 Save-UserPreferences -downloadRoot $script:downloadRootPath
@@ -422,11 +463,12 @@ Write-Host "Using authentication: $authType with value $authValue" -ForegroundCo
 $commonFlagsCore = @(
     '-f', 'bv*+ba/b',
     '--sub-langs', 'en.*,en',
+    '--write-subs',
+    '--write-auto-subs',
+    '--convert-subs', 'srt',
     '--embed-metadata',
     '--embed-subs',
     '--merge-output-format', 'mkv',
-    '--no-write-subs',
-    '--no-write-auto-subs',
     '--no-write-description',
     '--no-write-info-json',
     '--no-write-thumbnail',
@@ -442,7 +484,8 @@ function Download-BestVideo {
         [string[]]$commonArgs,
         [string]$authTypeValue, # Pass type
         [string]$authPathValue,   # Pass value
-        [string]$ytDlpPath 
+        [string]$ytDlpPath,
+        [switch]$TreatErrorsAsWarnings = $false
     )
     $videoUrl = Read-Host "Please enter the YouTube video URL"
     if (-not $videoUrl) { Write-Warning "No URL provided. Exiting."; return }
@@ -473,8 +516,26 @@ function Download-BestVideo {
     Write-Host ("Executing yt-dlp with arguments: {0}" -f ($ArgumentList -join ' ')) -ForegroundColor Yellow
     try {
         & $ytDlpPath $ArgumentList
-        if ($LASTEXITCODE -ne 0) { Write-Error "yt-dlp failed with exit code $LASTEXITCODE." } else { Write-Host "Download completed successfully." -ForegroundColor Green }
-    } catch { Write-Error "An error occurred launching yt-dlp: $($_.Exception.Message)" }
+        $singleExitCode = $LASTEXITCODE
+        if ($singleExitCode -ne 0) { 
+            $errorMessage = "yt-dlp finished with exit code $singleExitCode (video may have been unavailable or failed to download)"
+            if ($TreatErrorsAsWarnings) {
+                Write-Warning $errorMessage
+                Write-Host "Single video download completed with warnings. Check the output above for details." -ForegroundColor Yellow
+            } else {
+                Write-Error $errorMessage
+            }
+        } else { 
+            Write-Host "Download completed successfully." -ForegroundColor Green 
+        }
+    } catch { 
+        $launchError = "An error occurred launching yt-dlp: $($_.Exception.Message)"
+        if ($TreatErrorsAsWarnings) {
+            Write-Warning $launchError
+        } else {
+            Write-Error $launchError
+        }
+    }
 }
 
 # Function to download a playlist with metadata into a named subfolder
@@ -485,7 +546,8 @@ function Download-Playlist {
         [string]$authTypeValue, # Pass type
         [string]$authPathValue,   # Pass value
         [string]$ytDlpPath, 
-        [string]$PlaylistUrlOverride = $null
+        [string]$PlaylistUrlOverride = $null,
+        [switch]$TreatErrorsAsWarnings = $false
     )
     $playlistUrl = $PlaylistUrlOverride
     if (-not $playlistUrl) { $playlistUrl = Read-Host "Please enter the YouTube playlist URL" }
@@ -534,7 +596,7 @@ function Download-Playlist {
             }
 
             # If JSON parsing succeeded, extract title and id
-            if ($playlistInfo -ne $null) {
+            if ($null -ne $playlistInfo) {
                 if ($playlistInfo._type -eq 'playlist') {
                     if ($playlistInfo.title) { $playlistTitle = $playlistInfo.title }
                     if ($playlistInfo.id) { $playlistIdForNaming = $playlistInfo.id }
@@ -583,9 +645,7 @@ function Download-Playlist {
     $archivePath = Join-Path -Path $playlistOutputDir -ChildPath "download_archive.txt"
 
     # --- Construct Main Download Arguments --- 
-    $templateDir = $playlistOutputDir.Replace('\\', '/') 
-    $templateFilename = "%(title)s [%(id)s]"
-    $fullTemplateBase = "$templateDir/$templateFilename"
+    $templateDir = $playlistOutputDir.Replace('\\', '/')
 
     # Argument List for the main download
     $mainArgList = @()
@@ -610,8 +670,25 @@ function Download-Playlist {
     try {
         & $ytDlpPath $mainArgList
         $downloadExitCode = $LASTEXITCODE
-        if ($downloadExitCode -ne 0) { Write-Error "yt-dlp failed with exit code $downloadExitCode." } else { Write-Host "Playlist download completed successfully." -ForegroundColor Green }
-    } catch { Write-Error "An error occurred launching yt-dlp for playlist download: $($_.Exception.Message)" }
+        if ($downloadExitCode -ne 0) { 
+            $errorMessage = "yt-dlp finished with exit code $downloadExitCode (some videos may have been unavailable or failed to download)"
+            if ($TreatErrorsAsWarnings) {
+                Write-Warning $errorMessage
+                Write-Host "Playlist download completed with some warnings. Check the output above for details." -ForegroundColor Yellow
+            } else {
+                Write-Error $errorMessage
+            }
+        } else { 
+            Write-Host "Playlist download completed successfully." -ForegroundColor Green 
+        }
+    } catch { 
+        $launchError = "An error occurred launching yt-dlp for playlist download: $($_.Exception.Message)"
+        if ($TreatErrorsAsWarnings) {
+            Write-Warning $launchError
+        } else {
+            Write-Error $launchError
+        }
+    }
 }
 
 # Function to list user's playlists and initiate download
@@ -622,7 +699,8 @@ function List-And-Download-My-Playlists {
         [string]$authTypeValue, # Pass type
         [string]$authPathValue,   # Pass value
         [string]$ytDlpPath,
-        [switch]$ForceRefreshCache = $false
+        [switch]$ForceRefreshCache = $false,
+        [switch]$TreatErrorsAsWarnings = $false
     )
     if ($authTypeValue -ne 'cookies_browser' -or -not $authPathValue) { Write-Warning "Authentication required..."; return }
     
@@ -728,7 +806,7 @@ function List-And-Download-My-Playlists {
                 return
             }
 
-            if ($feedInfo -ne $null -and $feedInfo.entries) {
+            if ($null -ne $feedInfo -and $feedInfo.entries) {
                 $playlists = $feedInfo.entries | Where-Object { $_.url -and $_.title } 
             } else {
                 Write-Error "Could not find playlist entries in the feed JSON."
@@ -856,7 +934,7 @@ function List-And-Download-My-Playlists {
         # Save the playlist choice globally with ID when available, preserving root
         Save-UserPreferences -menuChoice "3" -playlistIndex $selection -playlistId $playlistId -downloadRoot $script:downloadRootPath
         
-        Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -PlaylistUrlOverride $selectedPlaylist.url -ytDlpPath $ytDlpPath
+        Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -PlaylistUrlOverride $selectedPlaylist.url -ytDlpPath $ytDlpPath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
     } else {
         Write-Warning "Invalid selection number."
     }
@@ -882,6 +960,7 @@ if ([string]::IsNullOrWhiteSpace($choice) -and $defaultChoice) {
 try {
     # Save user's menu choice (keep per-root and global in sync)
     if (-not [string]::IsNullOrWhiteSpace($choice)) {
+        if ($TreatYtDlpErrorsAsWarnings) { $script:treatYtDlpErrorsAsWarningsPref = $true }
         Save-UserPreferences -menuChoice $choice -playlistIndex $script:lastPlaylistIndex -playlistId $script:lastPlaylistId -downloadRoot $script:downloadRootPath
     }
 
@@ -889,19 +968,19 @@ try {
     switch ($choice) {
         "1" {
             Write-Host "Selected: Download Single Video" -ForegroundColor Yellow
-            Download-BestVideo -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath
+            Download-BestVideo -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
         }
         "2" {
             Write-Host "Selected: Download Playlist by URL" -ForegroundColor Yellow
-            Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath
+            Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
         }
         "3" {
             Write-Host "Selected: List & Download My Playlist" -ForegroundColor Yellow
-            List-And-Download-My-Playlists -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath
+            List-And-Download-My-Playlists -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
         }
         "4" {
             Write-Host "Selected: List & Download My Playlist (Force Refresh Cache)" -ForegroundColor Yellow
-            List-And-Download-My-Playlists -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -ForceRefreshCache
+            List-And-Download-My-Playlists -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -ForceRefreshCache -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
         }
         default {
             Write-Warning "Invalid choice. Exiting."
