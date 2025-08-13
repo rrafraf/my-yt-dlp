@@ -1,61 +1,89 @@
 #Requires -Version 5.0
 param()
 
-# --- START Preference Handling ---
-$userPrefsFile = Join-Path -Path $PSScriptRoot -ChildPath "user_preferences.json"
-$script:currentYtDlpVersion = $null # Stores the version tag of the current yt-dlp.exe
-$script:lastChoice = $null # Keep existing preference
-$script:lastPlaylistIndex = $null # Keep existing preference
-$script:lastPlaylistId = $null # Keep existing preference
+# --- START Console Encoding ---
+try {
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+    $OutputEncoding = [System.Text.UTF8Encoding]::new()
+} catch {
+    Write-Verbose "Could not set UTF-8 console encoding: $($_.Exception.Message)"
+}
+# --- END Console Encoding ---
 
-# Function to save user preferences
+# --- START Preference Handling ---
+# Global preferences file (in script directory)
+$globalPrefsFile = Join-Path -Path $PSScriptRoot -ChildPath "user_preferences.json"
+
+# Script-level state
+$script:currentYtDlpVersion = $null # Stores the version tag of the current yt-dlp.exe
+$script:lastChoice = $null
+$script:lastPlaylistIndex = $null
+$script:lastPlaylistId = $null
+$script:downloadRootPath = $null
+$script:perRootPrefsFile = $null
+
+# Function to save preferences (global only)
 function Save-UserPreferences {
     [CmdletBinding()]
     param(
         [string]$menuChoice = $script:lastChoice,
         [string]$playlistIndex = $script:lastPlaylistIndex,
         [string]$playlistId = $script:lastPlaylistId,
-        [string]$ytDlpVersion = $script:currentYtDlpVersion # Use current script value if not passed
+        [string]$ytDlpVersion = $script:currentYtDlpVersion,
+        [string]$downloadRoot = $script:downloadRootPath
     )
-    
-    # Update script variables before saving
+
+    # Update script variables
     $script:lastChoice = $menuChoice
     $script:lastPlaylistIndex = $playlistIndex
     $script:lastPlaylistId = $playlistId
     $script:currentYtDlpVersion = $ytDlpVersion
+    if ($downloadRoot) { $script:downloadRootPath = $downloadRoot }
 
-    $preferences = @{
-        lastMenuChoice = $script:lastChoice
-        lastPlaylistIndex = $script:lastPlaylistIndex
-        lastPlaylistId = $script:lastPlaylistId
-        currentYtDlpVersion = $script:currentYtDlpVersion # Save the version
+    # Ensure we have a download root (default to ./Downloads)
+    if (-not $script:downloadRootPath) {
+        $script:downloadRootPath = Join-Path $PSScriptRoot "Downloads"
     }
-    
+
+    # Build and save GLOBAL prefs only
+    $globalPrefs = @{
+        lastMenuChoice       = $script:lastChoice
+        lastPlaylistIndex    = $script:lastPlaylistIndex
+        lastPlaylistId       = $script:lastPlaylistId
+        currentYtDlpVersion  = $script:currentYtDlpVersion
+        lastDownloadRootPath = $script:downloadRootPath
+    }
     try {
-        $preferences | ConvertTo-Json -Depth 5 | Set-Content -Path $userPrefsFile -Encoding UTF8 -Force
+        $globalPrefs | ConvertTo-Json -Depth 5 | Set-Content -Path $globalPrefsFile -Encoding UTF8 -Force
     } catch {
-        Write-Warning "Could not save preferences to '$userPrefsFile': $($_.Exception.Message)"
+        Write-Warning "Could not save global preferences to '$globalPrefsFile': $($_.Exception.Message)"
     }
 }
 
-# Function to load user preferences
+# Function to load preferences (global only)
 function Load-UserPreferences {
-    if (Test-Path $userPrefsFile) {
+    # Load global
+    if (Test-Path $globalPrefsFile) {
         try {
-            $userPrefs = Get-Content -Path $userPrefsFile -Raw | ConvertFrom-Json -ErrorAction Stop
-            
-            if ($userPrefs.PSObject.Properties.Name -contains 'lastMenuChoice') { $script:lastChoice = $userPrefs.lastMenuChoice }
-            if ($userPrefs.PSObject.Properties.Name -contains 'lastPlaylistIndex') { $script:lastPlaylistIndex = $userPrefs.lastPlaylistIndex }
-            if ($userPrefs.PSObject.Properties.Name -contains 'lastPlaylistId') { $script:lastPlaylistId = $userPrefs.lastPlaylistId }
-            if ($userPrefs.PSObject.Properties.Name -contains 'currentYtDlpVersion') { $script:currentYtDlpVersion = $userPrefs.currentYtDlpVersion }
-
-            Write-Host "Loaded preferences: YT-DLP Ver: $($script:currentYtDlpVersion), Last Choice: $($script:lastChoice), Last Playlist: $($script:lastPlaylistIndex)" -ForegroundColor DarkGray
+            $global = Get-Content -Path $globalPrefsFile -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($global.PSObject.Properties.Name -contains 'lastMenuChoice') { $script:lastChoice = $global.lastMenuChoice }
+            if ($global.PSObject.Properties.Name -contains 'lastPlaylistIndex') { $script:lastPlaylistIndex = $global.lastPlaylistIndex }
+            if ($global.PSObject.Properties.Name -contains 'lastPlaylistId') { $script:lastPlaylistId = $global.lastPlaylistId }
+            if ($global.PSObject.Properties.Name -contains 'currentYtDlpVersion') { $script:currentYtDlpVersion = $global.currentYtDlpVersion }
+            if ($global.PSObject.Properties.Name -contains 'lastDownloadRootPath') { $script:downloadRootPath = $global.lastDownloadRootPath }
         } catch {
-            Write-Warning "Could not load or parse user preferences from '$userPrefsFile': $($_.Exception.Message). Using defaults."
+            Write-Warning "Could not load or parse global preferences from '$globalPrefsFile': $($_.Exception.Message). Using defaults."
         }
     } else {
-        Write-Host "Preference file '$userPrefsFile' not found. Using defaults." -ForegroundColor DarkGray
+        Write-Host "Global preference file '$globalPrefsFile' not found. Using defaults." -ForegroundColor DarkGray
     }
+
+    # Ensure download root default
+    if (-not $script:downloadRootPath) {
+        $script:downloadRootPath = Join-Path $PSScriptRoot "Downloads"
+    }
+
+    Write-Host "Loaded preferences: YT-DLP Ver: $($script:currentYtDlpVersion), Last Choice: $($script:lastChoice), Last Playlist: $($script:lastPlaylistIndex), Download Root: $($script:downloadRootPath)" -ForegroundColor DarkGray
 }
 # --- END Preference Handling ---
 
@@ -237,6 +265,29 @@ Load-UserPreferences # Load preferences first
 
 Write-Host "Starting yt-dlp Helper Script..."
 
+# Prompt for or confirm Download Root (persist per-root and globally)
+$defaultRoot = if ($script:downloadRootPath) { $script:downloadRootPath } else { Join-Path $PSScriptRoot "Downloads" }
+$enteredRoot = Read-Host "Enter download root directory (press Enter to use last/default): [$defaultRoot]"
+if ([string]::IsNullOrWhiteSpace($enteredRoot)) { $enteredRoot = $defaultRoot }
+$script:downloadRootPath = $enteredRoot
+
+# Ensure directory exists
+if (-not (Test-Path $script:downloadRootPath -PathType Container)) {
+    try {
+        New-Item -ItemType Directory -Path $script:downloadRootPath -Force -ErrorAction Stop | Out-Null
+        Write-Host "Created download root: $($script:downloadRootPath)"
+    } catch {
+        Write-Error "Failed to create download root '$($script:downloadRootPath)': $($_.Exception.Message)"
+        exit 1
+    }
+}
+
+# Reload per-root preferences for the chosen root
+Load-UserPreferences
+
+# Save immediately so per-root prefs file is established
+Save-UserPreferences -downloadRoot $script:downloadRootPath
+
 $expectedYtDlpExePath = Join-Path $PSScriptRoot "yt-dlp.exe"
 $ytDlpExePath = $null # Will be set by the update check
 
@@ -276,7 +327,7 @@ function Get-AbsoluteFfmpegBinPath {
         # Check if the base path itself contains bin (less likely but possible)
         if (Test-Path (Join-Path -Path $baseInstallPath -ChildPath "bin") -ErrorAction SilentlyContinue) {
             $foundBinPath = Join-Path -Path $baseInstallPath -ChildPath "bin"
-             Write-Host "  Found FFmpeg bin directory directly under (Absolute): $foundBinPath" -ForegroundColor Green
+            Write-Host "  Found FFmpeg bin directory directly under (Absolute): $foundBinPath" -ForegroundColor Green
         } else {
             Write-Warning "  Could not locate the 'bin' directory within $baseInstallPath or its direct subdirectories."
         }
@@ -298,9 +349,9 @@ if (-not $absoluteFfmpegBinPath) {
             New-Item -ItemType Directory -Path $ffmpegInstallPath -Force -ErrorAction Stop | Out-Null
             Write-Host "  Created directory: $ffmpegInstallPath"
         } catch {
-             Write-Error "  Failed to create directory $ffmpegInstallPath. Check permissions. Error: $($_.Exception.Message)"
-             # Cannot proceed without install dir
-             exit 1
+            Write-Error "  Failed to create directory $ffmpegInstallPath. Check permissions. Error: $($_.Exception.Message)"
+            # Cannot proceed without install dir
+            exit 1
         }
     }
 
@@ -365,30 +416,30 @@ Write-Host "Using authentication: $authType with value $authValue" -ForegroundCo
 # --- End Authentication Setup ---
 
 # --- Download Functions ---
-$downloadArchiveFile = Join-Path -Path $PSScriptRoot -ChildPath "download_archive.txt"
-# Define common metadata/download flags
-# Build complex arguments outside the array
-$archiveArg = "--download-archive ""$downloadArchiveFile"""
+# Archive and outputs now live under the download root
 
-# Simple array of flags - NO trailing backslashes!
-$commonFlags = @(
-    $archiveArg,
-    '--write-description',
-    '--write-info-json',
-    '--write-subs',
-    '--write-auto-subs',
-    '--sub-langs "en.*,en"',
+# Core flags shared by all commands (archive is injected per-call for concurrency safety)
+$commonFlagsCore = @(
+    '-f', 'bv*+ba/b',
+    '--sub-langs', 'en.*,en',
     '--embed-metadata',
-    '--embed-thumbnail',
     '--embed-subs',
-    '--progress-delta 2' # Keep progress updates throttled
-) -join " "
+    '--merge-output-format', 'mkv',
+    '--no-write-subs',
+    '--no-write-auto-subs',
+    '--no-write-description',
+    '--no-write-info-json',
+    '--no-write-thumbnail',
+    '--progress-delta', '2'
+)
+
+
 
 # Function to download the best quality single video with metadata
 function Download-BestVideo {
     param(
         [string]$ffmpegLocationArg,
-        [string]$commonArgs,
+        [string[]]$commonArgs,
         [string]$authTypeValue, # Pass type
         [string]$authPathValue,   # Pass value
         [string]$ytDlpPath 
@@ -396,50 +447,41 @@ function Download-BestVideo {
     $videoUrl = Read-Host "Please enter the YouTube video URL"
     if (-not $videoUrl) { Write-Warning "No URL provided. Exiting."; return }
     
-    $outputDir = Join-Path $PSScriptRoot "Downloads"
-    if (-not (Test-Path $outputDir -PathType Container)) { 
-        try {
-            New-Item -ItemType Directory -Path $outputDir -Force -ErrorAction Stop | Out-Null
-            Write-Host "Created output directory: $outputDir"
-        } catch {
-             Write-Error "Failed to create directory $outputDir. Check permissions. Error: $($_.Exception.Message)"
-             return # Cannot proceed
-        }
+    $singlesRoot = Join-Path $script:downloadRootPath "Singles"
+    if (-not (Test-Path $singlesRoot -PathType Container)) {
+        try { New-Item -ItemType Directory -Path $singlesRoot -Force -ErrorAction Stop | Out-Null } catch { Write-Error "Failed to create directory $singlesRoot. Error: $($_.Exception.Message)"; return }
     }
 
-    # Construct the output template 
-    $outputTemplate = Join-Path $outputDir "%(title)s [%(id)s].%(ext)s"
+    $archivePath = Join-Path $singlesRoot "download_archive.txt"
+
+    # Construct the output template (Singles root)
+    $outputTemplate = Join-Path $singlesRoot "%(title)s [%(id)s].%(ext)s"
     
     # Build Argument List
     $ArgumentList = @()
-    if ($ffmpegLocationArg) { $ArgumentList += $ffmpegLocationArg.Split(' ', 2) } 
-    if ($commonArgs) { $ArgumentList += $commonArgs.Split(' ') } 
-    # Add auth args if present
+    if ($ffmpegLocationArg) { $ArgumentList += $ffmpegLocationArg.Split(' ', 2) }
+    if ($commonArgs) { $ArgumentList += $commonArgs }
+    $ArgumentList += '--download-archive', "`"$archivePath`""
     if ($authTypeValue -eq 'cookies_browser' -and $authPathValue) {
         $ArgumentList += '--cookies-from-browser'
-        $ArgumentList += $authPathValue  # Now contains "firefox:profilename"
+        $ArgumentList += $authPathValue
     }
-    $ArgumentList += '-o', $outputTemplate 
+    $ArgumentList += '-o', $outputTemplate
+    
     $ArgumentList += $videoUrl
 
-    Write-Host "Executing yt-dlp with arguments: $($ArgumentList -join ' ' )" -ForegroundColor Yellow
+    Write-Host ("Executing yt-dlp with arguments: {0}" -f ($ArgumentList -join ' ')) -ForegroundColor Yellow
     try {
         & $ytDlpPath $ArgumentList
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "yt-dlp failed with exit code $LASTEXITCODE. Check console output above for details."
-        } else {
-            Write-Host "Download completed successfully (or yt-dlp finished)." -ForegroundColor Green
-        }
-    } catch {
-        Write-Error "An error occurred launching yt-dlp: $($_.Exception.Message)"
-    }
+        if ($LASTEXITCODE -ne 0) { Write-Error "yt-dlp failed with exit code $LASTEXITCODE." } else { Write-Host "Download completed successfully." -ForegroundColor Green }
+    } catch { Write-Error "An error occurred launching yt-dlp: $($_.Exception.Message)" }
 }
 
 # Function to download a playlist with metadata into a named subfolder
 function Download-Playlist {
     param(
         [string]$ffmpegLocationArg,
-        [string]$commonArgs,
+        [string[]]$commonArgs,
         [string]$authTypeValue, # Pass type
         [string]$authPathValue,   # Pass value
         [string]$ytDlpPath, 
@@ -449,12 +491,13 @@ function Download-Playlist {
     if (-not $playlistUrl) { $playlistUrl = Read-Host "Please enter the YouTube playlist URL" }
     if (-not $playlistUrl) { Write-Warning "No URL provided. Exiting."; return }
 
-    $baseOutputDir = Join-Path $PSScriptRoot "Downloads"
+    $baseOutputDir = $script:downloadRootPath
 
     # --- Pre-fetch Playlist Title --- 
     Write-Host "Fetching playlist title to determine output folder..." -ForegroundColor Cyan
     $playlistTitle = $null
     $playlistFolder = "Playlist_UnknownTitle" 
+    $playlistIdForNaming = $null
     $playlistOutputDir = Join-Path -Path $baseOutputDir -ChildPath $playlistFolder
 
     # Build arg list for prefetch
@@ -490,42 +533,30 @@ function Download-Playlist {
                 } 
             }
 
-            # If JSON parsing succeeded, extract title
+            # If JSON parsing succeeded, extract title and id
             if ($playlistInfo -ne $null) {
-                if ($playlistInfo._type -eq 'playlist' -and $playlistInfo.title) {
-                    $playlistTitle = $playlistInfo.title
-                    Write-Host "  Playlist Title Found via JSON: $playlistTitle" -ForegroundColor Green
+                if ($playlistInfo._type -eq 'playlist') {
+                    if ($playlistInfo.title) { $playlistTitle = $playlistInfo.title }
+                    if ($playlistInfo.id) { $playlistIdForNaming = $playlistInfo.id }
+                    Write-Host "  Playlist title/id for naming: $playlistTitle / $playlistIdForNaming" -ForegroundColor Green
                 } else {
-                    Write-Warning "  JSON parsed, but missing '_type: playlist' or 'title' field. Using default folder name." 
+                    Write-Warning "  JSON parsed, but missing '_type: playlist'. Using defaults." 
                 }
             }
         }
         
-        # If we have a title, sanitize and set $playlistFolder
+        # Choose folder name with ID suffix for uniqueness
         if ($playlistTitle) { 
-            # Sanitize title for folder name
             $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
             $sanitizedTitle = $playlistTitle
-            
-            # Replace invalid characters with underscore, but don't add underscores between valid characters
-            foreach ($char in $invalidChars) {
-                $sanitizedTitle = $sanitizedTitle.Replace($char, '_')
-            }
-            
-            # Replace multiple sequential underscores with a single one
+            foreach ($char in $invalidChars) { $sanitizedTitle = $sanitizedTitle.Replace($char, '_') }
             $sanitizedTitle = $sanitizedTitle -replace '_+', '_'
-            $sanitizedTitle = $sanitizedTitle.Trim('_') # Remove leading/trailing underscores
-            
-            if (-not [string]::IsNullOrWhiteSpace($sanitizedTitle)) {
-                $playlistFolder = $sanitizedTitle
-            } else {
-                Write-Warning "  Playlist title '$playlistTitle' resulted in an empty folder name after sanitization. Using default: $playlistFolder"
-            }
-        } else {
-            Write-Warning "  Could not determine playlist title. Using default folder: $playlistFolder"
-        } 
+            $sanitizedTitle = $sanitizedTitle.Trim('_')
+            if (-not [string]::IsNullOrWhiteSpace($sanitizedTitle)) { $playlistFolder = $sanitizedTitle }
+        }
+        if ($playlistIdForNaming) { $playlistFolder = "$playlistFolder [$playlistIdForNaming]" }
 
-        # Construct final output path based on fetched/sanitized/default title
+        # Construct final output path
         $playlistOutputDir = Join-Path -Path $baseOutputDir -ChildPath $playlistFolder
 
     } catch {
@@ -533,69 +564,54 @@ function Download-Playlist {
         Write-Warning "  Unable to determine specific playlist folder name, using default: $playlistFolder"
     }
 
-    # --- Setup Log File Path --- 
+    # --- Setup playlist directories --- 
     if (-not (Test-Path $playlistOutputDir -PathType Container)) {
          try {
             Write-Host "Creating playlist directory: $playlistOutputDir" -ForegroundColor Cyan
             New-Item -ItemType Directory -Path $playlistOutputDir -Force -ErrorAction Stop | Out-Null
         } catch {
-             Write-Error "Failed to create directory $playlistOutputDir. Check permissions. Error: $($_.Exception.Message)"
-             return # Cannot proceed without output dir
+            Write-Error "Failed to create directory $playlistOutputDir. Check permissions. Error: $($_.Exception.Message)"
+            return # Cannot proceed without output dir
         }
     }
+    # No subfolders; download everything directly into the playlist folder
+
     $logFilePath = Join-Path -Path $playlistOutputDir -ChildPath "_download.log"
     Write-Host "Logging yt-dlp output to: $logFilePath" -ForegroundColor Cyan
 
+    # Per-playlist archive inside the playlist folder
+    $archivePath = Join-Path -Path $playlistOutputDir -ChildPath "download_archive.txt"
+
     # --- Construct Main Download Arguments --- 
-    $templateDir = $playlistOutputDir.Replace('\', '/') 
+    $templateDir = $playlistOutputDir.Replace('\\', '/') 
     $templateFilename = "%(title)s [%(id)s]"
     $fullTemplateBase = "$templateDir/$templateFilename"
 
     # Argument List for the main download
     $mainArgList = @()
     if ($ffmpegLocationArg) { $mainArgList += $ffmpegLocationArg.Split(' ', 2) }
-    if ($commonArgs) { $mainArgList += $commonArgs.Split(' ') }
+    if ($commonArgs) { $mainArgList += $commonArgs }
+    $mainArgList += '--download-archive', "`"$archivePath`""
     if ($authTypeValue -eq 'cookies_browser' -and $authPathValue) {
         $mainArgList += '--cookies-from-browser'
-        $mainArgList += $authPathValue # Now contains "firefox:profilename"
+        $mainArgList += $authPathValue
     }
     
     # Add output template with proper quoting for Windows paths
-    # Use individual templates for each output type to ensure proper naming
     $mainArgList += '--output', "`"$templateDir/%(title)s [%(id)s].%(ext)s`""
-    $mainArgList += '--output-na-placeholder', "`"`""
-    $mainArgList += '--paths', "temp:$templateDir/temp"  # Temp directory for partial downloads
-    $mainArgList += '--paths', "home:$templateDir"       # Set home path
     
-    # Add the playlist URL as the final argument
     $mainArgList += $playlistUrl
 
-    Write-Host "Executing main download with arguments: $($mainArgList -join ' ' )" -ForegroundColor Yellow
+    # LOG: print without expanding arrays that might be interpreted strangely
+    Write-Host ("Executing main download with arguments: {0}" -f ($mainArgList -join ' ')) -ForegroundColor Yellow
     
     # --- Execute and Log --- 
-    $downloadOutput = $null
     $downloadExitCode = 1
     try {
-        # Setup log files
-        $stdoutLogPath = Join-Path -Path $playlistOutputDir -ChildPath "_download.log"
-        $stderrLogPath = Join-Path -Path $playlistOutputDir -ChildPath "_download_error.log"
-        
-        # Start the process asynchronously with proper output redirection
-        Write-Host "Starting download process (this may take a while)..." -ForegroundColor Cyan
-        
-        # Use the console window to show output directly
-        $process = Start-Process -FilePath $ytDlpPath -ArgumentList $mainArgList -NoNewWindow -PassThru -Wait
-        $downloadExitCode = $process.ExitCode
-        
-        if ($downloadExitCode -ne 0) {
-             Write-Error "yt-dlp failed with exit code $downloadExitCode."
-        } else {
-            Write-Host "Playlist download completed successfully." -ForegroundColor Green
-        }
-
-    } catch {
-        Write-Error "An error occurred launching yt-dlp for playlist download: $($_.Exception.Message)"
-    }
+        & $ytDlpPath $mainArgList
+        $downloadExitCode = $LASTEXITCODE
+        if ($downloadExitCode -ne 0) { Write-Error "yt-dlp failed with exit code $downloadExitCode." } else { Write-Host "Playlist download completed successfully." -ForegroundColor Green }
+    } catch { Write-Error "An error occurred launching yt-dlp for playlist download: $($_.Exception.Message)" }
 }
 
 # Function to list user's playlists and initiate download
@@ -614,7 +630,7 @@ function List-And-Download-My-Playlists {
     $defaultPlaylistIndex = $script:lastPlaylistIndex
     $defaultPlaylistId = $script:lastPlaylistId
     
-    # Setup cache file path
+    # Setup cache file path (still under project root)
     $cacheDir = Join-Path -Path $PSScriptRoot -ChildPath "cache"
     if (-not (Test-Path $cacheDir -PathType Container)) {
         try {
@@ -765,7 +781,7 @@ function List-And-Download-My-Playlists {
             $indexDisplay = ($i + 1).ToString()
             # Highlight the previously selected playlist if it's on this page
             if ($foundDefaultIndex -and ($i + 1) -eq $foundDefaultIndex) {
-                Write-Host ("  → {0,3}. {1}" -f $indexDisplay, $playlists[$i].title) -ForegroundColor Cyan
+                Write-Host ("  -> {0,3}. {1}" -f $indexDisplay, $playlists[$i].title) -ForegroundColor Cyan
             } else {
                 Write-Host ("    {0,3}. {1}" -f $indexDisplay, $playlists[$i].title)
             }
@@ -837,10 +853,10 @@ function List-And-Download-My-Playlists {
             $playlistId = $matches[1]
         }
         
-        # Save the playlist choice globally with ID when available
-        Save-UserPreferences -menuChoice "3" -playlistIndex $selection -playlistId $playlistId
+        # Save the playlist choice globally with ID when available, preserving root
+        Save-UserPreferences -menuChoice "3" -playlistIndex $selection -playlistId $playlistId -downloadRoot $script:downloadRootPath
         
-        Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlags -authTypeValue $authType -authPathValue $authValue -PlaylistUrlOverride $selectedPlaylist.url -ytDlpPath $ytDlpPath
+        Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -PlaylistUrlOverride $selectedPlaylist.url -ytDlpPath $ytDlpPath
     } else {
         Write-Warning "Invalid selection number."
     }
@@ -848,89 +864,6 @@ function List-And-Download-My-Playlists {
 
 # --- Script Main Execution ---
 
-# Path for saved user preferences
-$userPrefsFile = Join-Path -Path $PSScriptRoot -ChildPath "user_preferences.json"
-$script:lastChoice = $null
-$script:lastPlaylistIndex = $null
-$script:lastPlaylistId = $null
-
-# Function to save user preferences
-function Save-UserPreferences {
-    param(
-        [string]$menuChoice,
-        [string]$playlistIndex = $null,
-        [string]$playlistId = $null
-    )
-    
-    $preferences = @{
-        lastMenuChoice = $menuChoice
-        lastPlaylistIndex = $playlistIndex
-        lastPlaylistId = $playlistId
-    }
-    
-    try {
-        $preferences | ConvertTo-Json | Set-Content -Path $userPrefsFile -Encoding UTF8 -Force
-        Write-Host "Preferences saved." -ForegroundColor DarkGray
-    } catch {
-        Write-Warning "Could not save preferences: $($_.Exception.Message)"
-    }
-}
-
-# Try to load user preferences if they exist
-if (Test-Path $userPrefsFile) {
-    try {
-        $userPrefs = Get-Content -Path $userPrefsFile -Raw | ConvertFrom-Json -ErrorAction Stop
-        $script:lastChoice = $userPrefs.lastMenuChoice
-        $script:lastPlaylistIndex = $userPrefs.lastPlaylistIndex
-        $script:lastPlaylistId = $userPrefs.lastPlaylistId
-        Write-Host "Loaded previous preferences. Last menu choice: $($script:lastChoice), Last playlist: $($script:lastPlaylistIndex)" -ForegroundColor DarkGray
-    } catch {
-        Write-Warning "Could not load user preferences: $($_.Exception.Message)"
-    }
-}
-
-Write-Host "Starting yt-dlp Helper Script..." -ForegroundColor Cyan
-
-# Construct and resolve path for yt-dlp.exe IN THE SCRIPT DIRECTORY
-$expectedYtDlpExePath = Join-Path $PSScriptRoot "yt-dlp.exe"
-$ytDlpExePath = $null # Initialize
-try {
-    $ytDlpExePath = Resolve-Path -Path $expectedYtDlpExePath -ErrorAction Stop
-} catch {
-    Write-Error "FATAL: Could not resolve expected path for yt-dlp.exe: $expectedYtDlpExePath. Error: $($_.Exception.Message)"
-    exit 1
-}
-
-# Check if the resolved path points to an existing file
-if (-not (Test-Path $ytDlpExePath -PathType Leaf)) {
-    Write-Error "FATAL: yt-dlp.exe not found at resolved location: $ytDlpExePath. Please ensure it exists in the same directory as this script ('$PSScriptRoot')."
-    exit 1
-}
-Write-Host "Found yt-dlp.exe at: $ytDlpExePath" -ForegroundColor Green
-
-# --- FFmpeg Setup Logic --- 
-# ... (FFmpeg setup logic uses $PSScriptRoot for its paths)
-# ... (Result is $ffmpegLocationArgument)
-
-# --- Authentication Setup --- (Now done above)
-
-# --- Common Flags Definition --- 
-$downloadArchiveFile = Join-Path -Path $PSScriptRoot -ChildPath "download_archive.txt"
-$archiveArg = "--download-archive ""$downloadArchiveFile"""
-$commonFlags = @(
-    $archiveArg,
-    '--write-description',
-    '--write-info-json',
-    '--write-subs',
-    '--write-auto-subs',
-    '--sub-langs "en.*,en"',
-    '--embed-metadata',
-    '--embed-thumbnail',
-    '--embed-subs',
-    '--progress-delta 2' 
-) -join " "
-
-# --- Menu --- 
 Write-Host "`nPlease choose an action:" -ForegroundColor Green
 Write-Host "1. Download Single Video (Best Quality + Metadata)"
 Write-Host "2. Download Playlist by URL (Best Quality + Metadata)"
@@ -947,28 +880,28 @@ if ([string]::IsNullOrWhiteSpace($choice) -and $defaultChoice) {
 }
 
 try {
-    # Save user's menu choice
+    # Save user's menu choice (keep per-root and global in sync)
     if (-not [string]::IsNullOrWhiteSpace($choice)) {
-        Save-UserPreferences -menuChoice $choice -playlistIndex $script:lastPlaylistIndex -playlistId $script:lastPlaylistId
+        Save-UserPreferences -menuChoice $choice -playlistIndex $script:lastPlaylistIndex -playlistId $script:lastPlaylistId -downloadRoot $script:downloadRootPath
     }
 
     # Pass the confirmed yt-dlp path and separated auth info
     switch ($choice) {
         "1" {
             Write-Host "Selected: Download Single Video" -ForegroundColor Yellow
-            Download-BestVideo -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlags -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath
+            Download-BestVideo -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath
         }
         "2" {
             Write-Host "Selected: Download Playlist by URL" -ForegroundColor Yellow
-            Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlags -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath
+            Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath
         }
         "3" {
             Write-Host "Selected: List & Download My Playlist" -ForegroundColor Yellow
-            List-And-Download-My-Playlists -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlags -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath
+            List-And-Download-My-Playlists -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath
         }
         "4" {
             Write-Host "Selected: List & Download My Playlist (Force Refresh Cache)" -ForegroundColor Yellow
-            List-And-Download-My-Playlists -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlags -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -ForceRefreshCache
+            List-And-Download-My-Playlists -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -ForceRefreshCache
         }
         default {
             Write-Warning "Invalid choice. Exiting."
