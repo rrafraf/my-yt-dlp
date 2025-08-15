@@ -614,7 +614,8 @@ function Download-Playlist {
         [string]$authPathValue,   # Pass value
         [string]$ytDlpPath, 
         [string]$PlaylistUrlOverride = $null,
-        [switch]$TreatErrorsAsWarnings = $false
+        [switch]$TreatErrorsAsWarnings = $false,
+        [switch]$PromptMetadataAfter = $false
     )
     $playlistUrl = $PlaylistUrlOverride
     if (-not $playlistUrl) { $playlistUrl = Read-Host "Please enter the YouTube playlist URL" }
@@ -754,6 +755,105 @@ function Download-Playlist {
             Write-Warning $launchError
         } else {
             Write-Error $launchError
+        }
+    }
+
+    # --- Optional post-process: fetch metadata/subtitles/transcripts only ---
+    if ($PromptMetadataAfter) {
+        $answer = Read-Host "Also fetch metadata and subtitles/transcripts now? (y/N)"
+        if ($answer -match '^(?i:y|yes)$') {
+            Write-Host "Starting metadata/subtitles-only fetch..." -ForegroundColor Cyan
+            # Use a dedicated sidecar folder under the playlist directory
+            $sidecarOutputDir = Join-Path -Path $playlistOutputDir -ChildPath "_sidecar"
+            if (-not (Test-Path $sidecarOutputDir -PathType Container)) {
+                try {
+                    New-Item -ItemType Directory -Path $sidecarOutputDir -Force -ErrorAction Stop | Out-Null
+                    Write-Host "Created sidecar output directory: $sidecarOutputDir" -ForegroundColor Cyan
+                } catch {
+                    Write-Warning "Failed to create sidecar directory. Falling back to playlist folder. Error: $($_.Exception.Message)"
+                    $sidecarOutputDir = $playlistOutputDir
+                }
+            }
+            $sidecarTemplateDir = $sidecarOutputDir.Replace('\\', '/')
+            $metaArgList = @()
+            if ($ffmpegLocationArg) { $metaArgList += $ffmpegLocationArg.Split(' ', 2) }
+            # Authentication if available
+            if ($authTypeValue -eq 'cookies_browser' -and $authPathValue) {
+                $metaArgList += '--cookies-from-browser'
+                $metaArgList += $authPathValue
+            }
+            # Only sidecar assets, no media
+            $metaArgList += '--skip-download'
+            $metaArgList += '--write-info-json'
+            $metaArgList += '--write-subs'
+            $metaArgList += '--write-auto-subs'
+            $metaArgList += '--convert-subs', 'srt'
+            $metaArgList += '--sub-langs', 'en.*,en'
+            # Output template to sidecar folder
+            $metaArgList += '--output', "`"$sidecarTemplateDir/%(title)s [%(id)s].%(ext)s`""
+            $metaArgList += $playlistUrl
+
+            try {
+                Write-Host ("Executing metadata-only with arguments: {0}" -f ($metaArgList -join ' ')) -ForegroundColor DarkYellow
+                & $ytDlpPath $metaArgList
+                $metaExitCode = $LASTEXITCODE
+                if ($metaExitCode -ne 0) {
+                    $metaMessage = "Metadata/subtitles run finished with exit code $metaExitCode"
+                    if ($TreatErrorsAsWarnings) { Write-Warning $metaMessage } else { Write-Error $metaMessage }
+                } else {
+                    Write-Host "Metadata/subtitles fetch completed successfully." -ForegroundColor Green
+                }
+            } catch {
+                $metaLaunchErr = "Error launching yt-dlp for metadata-only run: $($_.Exception.Message)"
+                if ($TreatErrorsAsWarnings) { Write-Warning $metaLaunchErr } else { Write-Error $metaLaunchErr }
+            }
+
+            # --- Post-process: convert SRT subtitles to plain text transcripts (.txt) ---
+            try {
+                $textOutDir = Join-Path -Path $sidecarOutputDir -ChildPath "text"
+                if (-not (Test-Path $textOutDir -PathType Container)) {
+                    New-Item -ItemType Directory -Path $textOutDir -Force -ErrorAction Stop | Out-Null
+                }
+                $srtFiles = Get-ChildItem -Path $sidecarOutputDir -Filter '*.srt' -File -Recurse -ErrorAction SilentlyContinue
+                if ($srtFiles -and $srtFiles.Count -gt 0) {
+                    Write-Host "Converting $($srtFiles.Count) SRT file(s) to TXT transcripts..." -ForegroundColor Cyan
+                } else {
+                    Write-Host "No SRT files found to convert in sidecar folder." -ForegroundColor DarkGray
+                }
+                foreach ($srt in $srtFiles) {
+                    $txtPath = Join-Path -Path $textOutDir -ChildPath ("{0}.txt" -f $srt.BaseName)
+                    try {
+                        $lines = Get-Content -Path $srt.FullName -ErrorAction Stop
+                        $stripped = New-Object System.Collections.Generic.List[string]
+                        foreach ($line in $lines) {
+                            if ($line -match '^[\t\s]*\d+[\t\s]*$') { continue } # drop sequence numbers
+                            if ($line -match '\-\-\>') { continue }            # drop timing lines
+                            $clean = ($line -replace '<[^>]+>', '')               # drop simple HTML tags like <i>
+                            $stripped.Add($clean)
+                        }
+                        # compress multiple blank lines
+                        $final = New-Object System.Collections.Generic.List[string]
+                        $prevBlank = $false
+                        foreach ($l in $stripped) {
+                            $isBlank = [string]::IsNullOrWhiteSpace($l)
+                            if ($isBlank) {
+                                if (-not $prevBlank) { $final.Add(''); $prevBlank = $true }
+                            } else {
+                                $final.Add($l)
+                                $prevBlank = $false
+                            }
+                        }
+                        $final | Set-Content -Path $txtPath -Encoding UTF8 -ErrorAction Stop
+                        Write-Host "  Wrote transcript: $txtPath" -ForegroundColor Green
+                    } catch {
+                        Write-Warning "  Failed to convert '$($srt.FullName)' to txt: $($_.Exception.Message)"
+                    }
+                }
+            } catch {
+                Write-Warning "Transcript conversion step encountered an error: $($_.Exception.Message)"
+            }
+        } else {
+            Write-Host "Skipped metadata/subtitles fetch." -ForegroundColor DarkGray
         }
     }
 }
@@ -1001,7 +1101,7 @@ function List-And-Download-My-Playlists {
         # Save the playlist choice globally with ID when available, preserving root
         Save-UserPreferences -menuChoice "3" -playlistIndex $selection -playlistId $playlistId -downloadRoot $script:downloadRootPath
         
-        Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -PlaylistUrlOverride $selectedPlaylist.url -ytDlpPath $ytDlpPath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
+            Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -PlaylistUrlOverride $selectedPlaylist.url -ytDlpPath $ytDlpPath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp -PromptMetadataAfter
     } else {
         Write-Warning "Invalid selection number."
     }
@@ -1095,7 +1195,7 @@ try {
         }
         "2" {
             Write-Host "Selected: Download Playlist by URL" -ForegroundColor Yellow
-            Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
+            Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp -PromptMetadataAfter
         }
         "3" {
             if (-not $script:authAvailable) {
