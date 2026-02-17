@@ -75,15 +75,27 @@ function Save-UserPreferences {
         $script:downloadRootPath = Join-Path $PSScriptRoot "Downloads"
     }
 
-    # Build and save GLOBAL prefs only
-    $globalPrefs = @{
-        lastMenuChoice       = $script:lastChoice
-        lastPlaylistIndex    = $script:lastPlaylistIndex
-        lastPlaylistId       = $script:lastPlaylistId
-        currentYtDlpVersion  = $script:currentYtDlpVersion
-        lastDownloadRootPath = $script:downloadRootPath
-        treatYtDlpErrorsAsWarningsPreferred = if ($TreatYtDlpErrorsAsWarnings) { $true } else { $script:treatYtDlpErrorsAsWarningsPref }
+    # Build and save GLOBAL prefs only, preserving additional keys.
+    $globalPrefs = [ordered]@{}
+    if (Test-Path -Path $globalPrefsFile -PathType Leaf) {
+        try {
+            $existingGlobalPrefs = Get-Content -Path $globalPrefsFile -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($null -ne $existingGlobalPrefs) {
+                foreach ($prop in $existingGlobalPrefs.PSObject.Properties) {
+                    $globalPrefs[$prop.Name] = $prop.Value
+                }
+            }
+        } catch {
+            # Ignore parse errors here; we'll rewrite a fresh preferences object below.
+        }
     }
+
+    $globalPrefs['lastMenuChoice'] = $script:lastChoice
+    $globalPrefs['lastPlaylistIndex'] = $script:lastPlaylistIndex
+    $globalPrefs['lastPlaylistId'] = $script:lastPlaylistId
+    $globalPrefs['currentYtDlpVersion'] = $script:currentYtDlpVersion
+    $globalPrefs['lastDownloadRootPath'] = $script:downloadRootPath
+    $globalPrefs['treatYtDlpErrorsAsWarningsPreferred'] = if ($TreatYtDlpErrorsAsWarnings) { $true } else { $script:treatYtDlpErrorsAsWarningsPref }
     try {
         $globalPrefs | ConvertTo-Json -Depth 5 | Set-Content -Path $globalPrefsFile -Encoding UTF8 -Force
     } catch {

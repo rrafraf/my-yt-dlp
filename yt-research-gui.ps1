@@ -15,6 +15,125 @@ Add-Type -AssemblyName System.Windows.Forms
 $script:logDir = Join-Path $PSScriptRoot 'logs'
 $script:logPath = $null
 $script:logSync = New-Object object
+$script:loggingConfigPath = Join-Path $PSScriptRoot 'yt-research-gui.config.json'
+$script:logLevels = @{
+    DEBUG = 10
+    INFO  = 20
+    WARN  = 30
+    ERROR = 40
+}
+$script:currentLogLevel = 'INFO'
+$script:logRetentionDays = 14
+
+function Load-LoggingSettings {
+    $script:currentLogLevel = 'INFO'
+    $script:logRetentionDays = 14
+
+    if (-not (Test-Path -LiteralPath $script:loggingConfigPath -PathType Leaf)) {
+        return
+    }
+
+    try {
+        $config = Get-Content -LiteralPath $script:loggingConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        return
+    }
+
+    if ($null -eq $config -or -not ($config.PSObject.Properties.Name -contains 'logging')) {
+        return
+    }
+
+    $logging = $config.logging
+    if ($null -eq $logging) {
+        return
+    }
+
+    if ($logging.PSObject.Properties.Name -contains 'level') {
+        $candidateLevel = ([string]$logging.level).Trim().ToUpperInvariant()
+        if ($script:logLevels.ContainsKey($candidateLevel)) {
+            $script:currentLogLevel = $candidateLevel
+        }
+    }
+
+    if ($logging.PSObject.Properties.Name -contains 'retentionDays') {
+        $candidateRetention = 0
+        if ([int]::TryParse([string]$logging.retentionDays, [ref]$candidateRetention) -and $candidateRetention -ge 0) {
+            $script:logRetentionDays = $candidateRetention
+        }
+    }
+}
+
+function Should-WriteLog {
+    param(
+        [ValidateSet('DEBUG', 'INFO', 'WARN', 'ERROR')]
+        [string]$Level
+    )
+
+    if (-not $script:logLevels.ContainsKey($script:currentLogLevel)) {
+        $script:currentLogLevel = 'INFO'
+    }
+
+    return ($script:logLevels[$Level] -ge $script:logLevels[$script:currentLogLevel])
+}
+
+function Trim-LogFile {
+    if ([string]::IsNullOrWhiteSpace($script:logPath) -or -not (Test-Path -LiteralPath $script:logPath -PathType Leaf)) {
+        return
+    }
+
+    if ($script:logRetentionDays -le 0) {
+        return
+    }
+
+    try {
+        $content = Get-Content -LiteralPath $script:logPath -Raw -Encoding UTF8 -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($content)) {
+            return
+        }
+
+        $normalized = $content -replace "`r`n", "`n"
+        $pattern = '(?ms)^\[(?<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\] \[(?:DEBUG|INFO|WARN|ERROR)\] .*?(?=^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] \[(?:DEBUG|INFO|WARN|ERROR)\] |\z)'
+        $matches = [System.Text.RegularExpressions.Regex]::Matches($normalized, $pattern)
+        if ($matches.Count -eq 0) {
+            return
+        }
+
+        $cutoff = (Get-Date).AddDays(-$script:logRetentionDays)
+        $entriesToKeep = New-Object System.Collections.Generic.List[string]
+
+        foreach ($entry in $matches) {
+            $timestamp = [datetime]::MinValue
+            $timestampText = $entry.Groups['ts'].Value
+            $isParsed = [datetime]::TryParseExact(
+                $timestampText,
+                'yyyy-MM-dd HH:mm:ss.fff',
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::None,
+                [ref]$timestamp
+            )
+
+            if (-not $isParsed -or $timestamp -ge $cutoff) {
+                $entriesToKeep.Add($entry.Value.TrimEnd("`n"))
+            }
+        }
+
+        if ($entriesToKeep.Count -eq $matches.Count) {
+            return
+        }
+
+        if ($entriesToKeep.Count -eq 0) {
+            Set-Content -LiteralPath $script:logPath -Value '' -Encoding UTF8 -Force
+            return
+        }
+
+        $newContent = ($entriesToKeep -join "`r`n") + "`r`n"
+        Set-Content -LiteralPath $script:logPath -Value $newContent -Encoding UTF8 -Force
+    }
+    catch {
+        # Log trimming is best-effort.
+    }
+}
 
 function Initialize-Logger {
     try {
@@ -27,6 +146,7 @@ function Initialize-Logger {
             $null = New-Item -ItemType File -Path $script:logPath -Force
         }
 
+        Trim-LogFile
         Write-Log -Level 'INFO' -Message '----------------------------------------'
         Write-Log -Level 'INFO' -Message "New session started. Log path: $script:logPath"
     }
@@ -45,6 +165,9 @@ function Write-Log {
 
     try {
         if ([string]::IsNullOrWhiteSpace($script:logPath)) {
+            return
+        }
+        if (-not (Should-WriteLog -Level $Level)) {
             return
         }
 
@@ -111,8 +234,10 @@ function Get-ErrorDetails {
     return [string]$ErrorObject
 }
 
+Load-LoggingSettings
 Initialize-Logger
 Write-Log -Level 'INFO' -Message ("PowerShell version: {0}" -f $PSVersionTable.PSVersion.ToString())
+Write-Log -Level 'INFO' -Message ("Logging configuration loaded. Level: {0} | RetentionDays: {1}" -f $script:currentLogLevel, $script:logRetentionDays)
 Write-Log -Level 'INFO' -Message "Script startup complete."
 
 function Get-DefaultFirefoxProfilePath {

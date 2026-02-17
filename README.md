@@ -11,7 +11,8 @@ A Windows-focused toolkit to:
 
 ### What’s in this repo
 - `yt-dlp-helper.ps1`: Entry point. Interactive menu for YouTube downloads and auto-setup of tools.
-- `user_preferences.json`: Stores last menu choice, playlist info, and currently used `yt-dlp` version.
+- `user_preferences.json`: Stores last menu choice, playlist info, and current `yt-dlp` version.
+- `yt-research-gui.config.json`: Stores configuration for `yt-research-gui.ps1` (including logging).
 - `ffmpeg_yt-dlp/`: Folder where the portable FFmpeg is downloaded and extracted.
 - `cache/`: Caches your YouTube playlists listing (`playlists_cache.json`).
 - `whatsapp_transcribe.py`: Batch transcribes WhatsApp `.opus` files using FFmpeg + OpenAI Whisper.
@@ -80,6 +81,17 @@ cd "C:\Users\<you>\Documents\GitHub\my-yt-dlp"
 - On start, the helper now asks for a download root path. The choice is remembered.
 - Each download root keeps its own `user_preferences.json` and `download_archive.txt` inside that path, so you can maintain separate contexts for different drives/folders.
 - A global `user_preferences.json` in the project stores the last used download root and the current `yt-dlp` version.
+
+### GUI logging configuration
+`yt-research-gui.ps1` reads logging settings from `yt-research-gui.config.json`:
+```json
+"logging": {
+  "level": "INFO",
+  "retentionDays": 14
+}
+```
+- `level`: one of `DEBUG`, `INFO`, `WARN`, `ERROR`.
+- `retentionDays`: keep only log entries newer than this many days at startup (set `0` to disable trimming).
 
 ### Where downloads go and what gets saved
 - Output root: `Downloads/`
