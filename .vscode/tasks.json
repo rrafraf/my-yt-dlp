@@ -1,0 +1,31 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run yt-dlp helper",
+      "type": "process",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\yt-dlp-helper.ps1"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "Run yt-research GUI",
+      "type": "process",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\yt-research-gui.ps1"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}

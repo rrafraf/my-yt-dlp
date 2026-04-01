@@ -1,18 +1,19 @@
-## my-yt-dlp Helper (Windows)
+﻿## my-yt-dlp Helper (Windows)
 
 A Windows-focused toolkit to:
 - Automatically fetch and keep `yt-dlp.exe` up to date (nightly builds)
 - Automatically download and wire up a portable FFmpeg for `yt-dlp`
 - Download YouTube videos or playlists (with metadata, thumbnails, subtitles, and duplicate prevention)
 - Optionally list your YouTube playlists (requires browser cookies)
-- Transcribe WhatsApp voice notes: convert `.opus` → `.wav` with FFmpeg and transcribe with Whisper
+- Transcribe WhatsApp voice notes: convert `.opus` в†’ `.wav` with FFmpeg and transcribe with Whisper
 
 ---
 
-### What’s in this repo
+### WhatвЂ™s in this repo
 - `yt-dlp-helper.ps1`: Entry point. Interactive menu for YouTube downloads and auto-setup of tools.
 - `user_preferences.json`: Stores last menu choice, playlist info, and current `yt-dlp` version.
-- `yt-research-gui.config.json`: Stores configuration for `yt-research-gui.ps1` (including logging).
+- `yt-research-gui.ps1`: Top-level launcher for the research GUI.
+- `yt-research-gui/`: Dedicated folder for the GUI implementation, config, Python project, logs, and cached transcript data.
 - `ffmpeg_yt-dlp/`: Folder where the portable FFmpeg is downloaded and extracted.
 - `cache/`: Caches your YouTube playlists listing (`playlists_cache.json`).
 - `whatsapp_transcribe.py`: Batch transcribes WhatsApp `.opus` files using FFmpeg + OpenAI Whisper.
@@ -27,6 +28,11 @@ A Windows-focused toolkit to:
 - Internet access (downloads yt-dlp nightly release and FFmpeg builds)
 - For playlist listing/authenticated downloads:
   - Firefox (Nightly or regular). You must point the script to your Firefox profile folder.
+- For on-demand GUI Whisper transcription:
+  - `uv` installed
+  - Python 3.10+ (managed through `uv` in `yt-research-gui/`)
+  - FFmpeg available under `ffmpeg_yt-dlp/` (installed by the helper script)
+  - GUI Python dependencies installed with `uv sync` inside `yt-research-gui/`
 - For WhatsApp transcription:
   - Python 3.9+ recommended
   - FFmpeg (auto-installed into `ffmpeg_yt-dlp` by the helper script, used by the Python script)
@@ -83,7 +89,7 @@ cd "C:\Users\<you>\Documents\GitHub\my-yt-dlp"
 - A global `user_preferences.json` in the project stores the last used download root and the current `yt-dlp` version.
 
 ### GUI logging configuration
-`yt-research-gui.ps1` reads logging settings from `yt-research-gui.config.json`:
+`yt-research-gui\yt-research-gui.ps1` reads logging settings from `yt-research-gui\yt-research-gui.config.json`:
 ```json
 "logging": {
   "level": "INFO",
@@ -92,6 +98,24 @@ cd "C:\Users\<you>\Documents\GitHub\my-yt-dlp"
 ```
 - `level`: one of `DEBUG`, `INFO`, `WARN`, `ERROR`.
 - `retentionDays`: keep only log entries newer than this many days at startup (set `0` to disable trimming).
+
+### GUI Python project
+- The GUI now has a dedicated `uv` project in `yt-research-gui/`.
+- The Whisper helper package lives under `yt-research-gui/src/yt_research_gui_whisper/`.
+- To refresh the GUI Python environment manually:
+```powershell
+cd .\yt-research-gui
+uv sync
+```
+
+### GUI on-demand Whisper fallback
+- The Transcript tab in `yt-research-gui.ps1` now exposes a `Transcribe with Whisper` button even when YouTube subtitles/auto-subs were found.
+- Whisper runs in the background and the Transcript tab shows a live activity pane plus progress text while it works.
+- The GUI still auto-detects your Firefox profile path, but `Use Firefox cookies` starts unchecked by default.
+- If a cookie-backed YouTube request fails with the `not available on this app` error, the GUI automatically retries that request without Firefox cookies.
+- The GUI keeps extracted audio in `yt-research-gui/data/audio/<videoId>.wav`.
+- The GUI keeps local transcript text in `yt-research-gui/data/transcripts/<videoId>.txt`.
+- If a local Whisper transcript already exists for that video ID, the button changes to `Load Whisper Transcript` and reuses the cached file.
 
 ### Where downloads go and what gets saved
 - Output root: `Downloads/`
@@ -156,7 +180,7 @@ Notes:
 
 ## Troubleshooting
 - Firefox profile path error: Re-check `about:profiles` and update `\$firefoxProfilePath` in `yt-dlp-helper.ps1`.
-- Corporate proxy/GitHub API issues: The helper will proceed with an existing local `yt-dlp.exe` if it can’t reach GitHub; otherwise it will stop with an error.
+- Corporate proxy/GitHub API issues: The helper will proceed with an existing local `yt-dlp.exe` if it canвЂ™t reach GitHub; otherwise it will stop with an error.
 - Script execution blocked: Use `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` for your current session.
 - Whisper install issues on Windows: Ensure Visual C++ Build Tools are installed if compilation is required, or use prebuilt wheels for Torch as shown above.
 
@@ -166,3 +190,4 @@ Notes:
 - Can I use a non-Nightly Firefox? Yes. Point `\$firefoxProfilePath` to the profile you actually use; the script only needs the folder name to pass to `yt-dlp`.
 - Where is `yt-dlp.exe` stored? In the repo root alongside the script, updated from the nightly builds.
 - How do I avoid re-downloading the same videos? The helper uses `--download-archive download_archive.txt` automatically. 
+

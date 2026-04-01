@@ -1,4 +1,4 @@
-# Cache folders
+﻿# Cache folders
 cache/
 **/cache/
 .cache/
@@ -24,3 +24,8 @@ cache/playlists_cache.json
 _tbt_audios/
 Transcripts/
 logs/
+yt-research-gui-data/
+yt-research-gui/.venv/
+yt-research-gui/data/
+yt-research-gui/logs/
+

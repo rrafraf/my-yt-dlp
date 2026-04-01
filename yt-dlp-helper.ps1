@@ -871,7 +871,7 @@ function Download-Playlist {
 }
 
 # Function to list user's playlists and initiate download
-function List-And-Download-My-Playlists {
+function Get-MyPlaylistsAndDownload {
     param(
         [string]$ffmpegLocationArg,
         [string]$commonArgs,
@@ -1215,7 +1215,7 @@ try {
                 break
             }
             Write-Host "Selected: List & Download My Playlist" -ForegroundColor Yellow
-            List-And-Download-My-Playlists -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
+            Get-MyPlaylistsAndDownload -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
         }
         "4" {
             if (-not $script:authAvailable) {
@@ -1223,7 +1223,7 @@ try {
                 break
             }
             Write-Host "Selected: List & Download My Playlist (Force Refresh Cache)" -ForegroundColor Yellow
-            List-And-Download-My-Playlists -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -ForceRefreshCache -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
+            Get-MyPlaylistsAndDownload -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -ForceRefreshCache -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
         }
         default {
             Write-Warning "Invalid choice. Exiting."
