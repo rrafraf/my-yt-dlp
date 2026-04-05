@@ -10,12 +10,12 @@ A Windows-focused toolkit to:
 ---
 
 ### WhatвЂ™s in this repo
-- `yt-dlp-helper.ps1`: Entry point. Interactive menu for YouTube downloads and auto-setup of tools.
-- `user_preferences.json`: Stores last menu choice, playlist info, current `yt-dlp` version, and your saved Firefox profile path.
+- `yt-dlp-helper.ps1`: Compatibility launcher that preserves the old helper entry point.
+- `yt-dlp-helper/`: Dedicated folder for the helper implementation, its local state, cache, and default downloads.
 - `yt-research-gui\yt-research-gui.ps1`: Launcher for the research GUI.
 - `yt-research-gui/`: Dedicated folder for the GUI implementation, config, Python project, logs, and cached transcript data.
-- `ffmpeg_yt-dlp/`: Folder where the portable FFmpeg is downloaded and extracted.
-- `cache/`: Caches your YouTube playlists listing (`playlists_cache.json`).
+- `ffmpeg_yt-dlp/`: Shared portable FFmpeg used by both the helper and the GUI.
+- `yt-dlp.exe`: Shared `yt-dlp` executable used by both the helper and the GUI.
 - `whatsapp_transcribe.py`: Batch transcribes WhatsApp `.opus` files using FFmpeg + OpenAI Whisper.
 - `Transcripts/`: Output folder for transcription results (created on demand).
 - `_tbt_audios/`: Place WhatsApp `.opus` files here for transcription.
@@ -29,7 +29,7 @@ A Windows-focused toolkit to:
 - For reliable YouTube format extraction:
   - A supported JavaScript runtime for `yt-dlp` challenge solving, such as Deno or Node.js 20+. The helper auto-detects and passes an available runtime.
 - For playlist listing/authenticated downloads:
-  - Firefox (Nightly or regular). The helper can scan for local Firefox profiles and save your chosen profile path in `user_preferences.json`.
+  - Firefox (Nightly or regular). The helper can scan for local Firefox profiles and save your chosen profile path in `yt-dlp-helper\user_preferences.json`.
 - For on-demand GUI Whisper transcription:
   - `uv` installed
   - Python 3.10+ (managed through `uv` in `yt-research-gui/`)
@@ -49,7 +49,7 @@ If you want to list/download your own playlists:
 1. Run `yt-dlp-helper.ps1`.
 2. If no Firefox profile is saved yet, or the saved one no longer exists, the helper will scan your system for Firefox profiles and list them as choices.
 3. Pick one of the detected profiles, or choose the manual-entry option and paste the absolute profile folder path yourself.
-4. The selected path is saved in `user_preferences.json` for future runs.
+4. The selected path is saved in `yt-dlp-helper\user_preferences.json` for future runs.
 
 If you need to verify the path manually first, open Firefox and go to `about:profiles`, then copy the absolute folder path for the profile you use for YouTube logins.
 
@@ -74,9 +74,9 @@ cd "C:\Users\<you>\Documents\GitHub\my-yt-dlp"
 ```
 
 3. On first run, it will:
-   - Check/download the latest yt-dlp nightly build into the repo directory (`yt-dlp.exe`)
-   - Download a portable FFmpeg zip, extract it to `ffmpeg_yt-dlp/`, and pass `--ffmpeg-location` to `yt-dlp`
-   - Load/save preferences in `user_preferences.json`
+   - Check/download the latest shared `yt-dlp` nightly build into the repo root (`yt-dlp.exe`)
+   - Download a shared portable FFmpeg zip, extract it to `ffmpeg_yt-dlp/`, and pass `--ffmpeg-location` to `yt-dlp`
+   - Load/save helper preferences in `yt-dlp-helper\user_preferences.json`
 
 4. Choose a menu option:
    - 1: Download Single Video (best quality + metadata)
@@ -87,7 +87,7 @@ cd "C:\Users\<you>\Documents\GitHub\my-yt-dlp"
 ### Download root and per-location preferences
 - On start, the helper now asks for a download root path. The choice is remembered.
 - Each download root keeps its own `user_preferences.json` and `download_archive.txt` inside that path, so you can maintain separate contexts for different drives/folders.
-- A global `user_preferences.json` in the project stores the last used download root, the current `yt-dlp` version, and the saved Firefox profile path.
+- The helper-global `yt-dlp-helper\user_preferences.json` stores the last used download root, the current `yt-dlp` version, and the saved Firefox profile path.
 
 ### GUI logging configuration
 `yt-research-gui\yt-research-gui.ps1` reads logging settings from `yt-research-gui\yt-research-gui.config.json`:
@@ -119,7 +119,8 @@ uv sync
 - If a local Whisper transcript already exists for that video ID, the button changes to `Load Whisper Transcript` and reuses the cached file.
 
 ### Where downloads go and what gets saved
-- Output root: `Downloads/`
+- Default output root: `yt-dlp-helper/Downloads/`
+- If you choose a different root at launch, the same structure is created under that selected path.
   - Single videos: `Downloads/%(title)s [%(id)s].%(ext)s`
   - Playlists: `Downloads/<Sanitized Playlist Title>/*`
 - Metadata and extras (enabled by default):
@@ -133,12 +134,12 @@ uv sync
 ### Authentication details (cookies)
 - The script extracts your Firefox profile folder name and passes it to `yt-dlp` as:
   - `--cookies-from-browser firefox:<profileName>`
-- The full Firefox profile path is stored locally in `user_preferences.json`.
+- The full Firefox profile path is stored locally in `yt-dlp-helper\user_preferences.json`.
 - On startup, the helper validates the saved path. You can keep it, choose a newly detected profile, or paste a different path manually.
 
 ### Playlist listing and cache
 - Listing your playlists uses the YouTube feed URL and cookies
-- Results are cached to `cache/playlists_cache.json` for 24 hours
+- Results are cached to `yt-dlp-helper/cache/playlists_cache.json` for 24 hours
 - Use menu option 4 to refresh immediately
 
 ---
@@ -174,7 +175,7 @@ Notes:
 ---
 
 ## Customization Tips
-- Change subtitle languages by editing `--sub-langs` in `yt-dlp-helper.ps1` (default: `"en.*,en"`).
+- Change subtitle languages by editing `--sub-langs` in `yt-dlp-helper/yt-dlp-helper.ps1` (default: `"en.*,en"`).
 - Disable/enable metadata/thumbnails/subs by removing or adding flags in the `$commonFlags` array.
 - Adjust playlist page size or cache duration in `List-And-Download-My-Playlists` if desired.
 
@@ -191,6 +192,6 @@ Notes:
 
 ## FAQ
 - Can I use a non-Nightly Firefox? Yes. Choose the profile you actually use in the helper prompt; the script only needs the folder name to pass to `yt-dlp`.
-- Where is `yt-dlp.exe` stored? In the repo root alongside the script, updated from the nightly builds.
+- Where is `yt-dlp.exe` stored? In the repo root as a shared tool for both the helper and the GUI, updated from the nightly builds.
 - How do I avoid re-downloading the same videos? The helper uses `--download-archive download_archive.txt` automatically. 
 

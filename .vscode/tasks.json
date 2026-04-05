@@ -4,20 +4,23 @@
     {
       "label": "Run yt-dlp helper",
       "type": "process",
-      "command": "powershell",
+      "command": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
       "args": [
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        "${workspaceFolder}\\yt-dlp-helper.ps1"
+        "${workspaceFolder}\\yt-dlp-helper\\yt-dlp-helper.ps1"
       ],
+      "options": {
+        "cwd": "${workspaceFolder}\\yt-dlp-helper"
+      },
       "problemMatcher": []
     },
     {
       "label": "Run yt-research GUI",
       "type": "process",
-      "command": "powershell",
+      "command": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
       "args": [
         "-NoProfile",
         "-ExecutionPolicy",

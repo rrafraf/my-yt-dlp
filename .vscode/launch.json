@@ -5,8 +5,8 @@
       "name": "Launch yt-dlp helper",
       "type": "PowerShell",
       "request": "launch",
-      "script": "${workspaceFolder}\\yt-dlp-helper.ps1",
-      "cwd": "${workspaceFolder}",
+      "script": "${workspaceFolder}\\yt-dlp-helper\\yt-dlp-helper.ps1",
+      "cwd": "${workspaceFolder}\\yt-dlp-helper",
       "createTemporaryIntegratedConsole": true
     },
     {
