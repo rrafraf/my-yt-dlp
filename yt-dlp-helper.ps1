@@ -51,6 +51,7 @@ $script:lastPlaylistId = $null
 $script:downloadRootPath = $null
 $script:perRootPrefsFile = $null
 $script:treatYtDlpErrorsAsWarningsPref = $false
+$script:firefoxProfilePath = $null
 
 # Function to save preferences (global only)
 function Save-UserPreferences {
@@ -60,7 +61,8 @@ function Save-UserPreferences {
         [string]$playlistIndex = $script:lastPlaylistIndex,
         [string]$playlistId = $script:lastPlaylistId,
         [string]$ytDlpVersion = $script:currentYtDlpVersion,
-        [string]$downloadRoot = $script:downloadRootPath
+        [string]$downloadRoot = $script:downloadRootPath,
+        [string]$firefoxProfilePath = $script:firefoxProfilePath
     )
 
     # Update script variables
@@ -69,6 +71,7 @@ function Save-UserPreferences {
     $script:lastPlaylistId = $playlistId
     $script:currentYtDlpVersion = $ytDlpVersion
     if ($downloadRoot) { $script:downloadRootPath = $downloadRoot }
+    $script:firefoxProfilePath = $firefoxProfilePath
 
     # Ensure we have a download root (default to ./Downloads)
     if (-not $script:downloadRootPath) {
@@ -95,6 +98,7 @@ function Save-UserPreferences {
     $globalPrefs['lastPlaylistId'] = $script:lastPlaylistId
     $globalPrefs['currentYtDlpVersion'] = $script:currentYtDlpVersion
     $globalPrefs['lastDownloadRootPath'] = $script:downloadRootPath
+    $globalPrefs['firefoxProfilePath'] = $script:firefoxProfilePath
     $globalPrefs['treatYtDlpErrorsAsWarningsPreferred'] = if ($TreatYtDlpErrorsAsWarnings) { $true } else { $script:treatYtDlpErrorsAsWarningsPref }
     try {
         $globalPrefs | ConvertTo-Json -Depth 5 | Set-Content -Path $globalPrefsFile -Encoding UTF8 -Force
@@ -114,6 +118,7 @@ function Load-UserPreferences {
             if ($global.PSObject.Properties.Name -contains 'lastPlaylistId') { $script:lastPlaylistId = $global.lastPlaylistId }
             if ($global.PSObject.Properties.Name -contains 'currentYtDlpVersion') { $script:currentYtDlpVersion = $global.currentYtDlpVersion }
             if ($global.PSObject.Properties.Name -contains 'lastDownloadRootPath') { $script:downloadRootPath = $global.lastDownloadRootPath }
+            if ($global.PSObject.Properties.Name -contains 'firefoxProfilePath') { $script:firefoxProfilePath = $global.firefoxProfilePath }
             if ($global.PSObject.Properties.Name -contains 'treatYtDlpErrorsAsWarningsPreferred') { $script:treatYtDlpErrorsAsWarningsPref = [bool]$global.treatYtDlpErrorsAsWarningsPreferred }
         } catch {
             Write-Warning "Could not load or parse global preferences from '$globalPrefsFile': $($_.Exception.Message). Using defaults."
@@ -127,9 +132,377 @@ function Load-UserPreferences {
         $script:downloadRootPath = Join-Path $PSScriptRoot "Downloads"
     }
 
-    Write-Host "Loaded preferences: YT-DLP Ver: $($script:currentYtDlpVersion), Last Choice: $($script:lastChoice), Last Playlist: $($script:lastPlaylistIndex), Download Root: $($script:downloadRootPath)" -ForegroundColor DarkGray
+    Write-Host "Loaded preferences: YT-DLP Ver: $($script:currentYtDlpVersion), Last Choice: $($script:lastChoice), Last Playlist: $($script:lastPlaylistIndex), Download Root: $($script:downloadRootPath), Firefox Profile: $($script:firefoxProfilePath)" -ForegroundColor DarkGray
 }
 # --- END Preference Handling ---
+
+function Test-FirefoxProfilePath {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [string]$ProfilePath
+    )
+
+    $result = [ordered]@{
+        IsValid = $false
+        ProfilePath = $ProfilePath
+        ProfileName = $null
+        StatusMessage = $null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
+        $result.StatusMessage = 'profile path is empty or not set'
+        return [pscustomobject]$result
+    }
+
+    try {
+        $resolvedPath = (Resolve-Path -LiteralPath $ProfilePath -ErrorAction Stop).Path
+    } catch {
+        $result.StatusMessage = "profile path does not exist: $ProfilePath"
+        return [pscustomobject]$result
+    }
+
+    if (-not (Test-Path -LiteralPath $resolvedPath -PathType Container)) {
+        $result.StatusMessage = "profile path does not exist: $resolvedPath"
+        return [pscustomobject]$result
+    }
+
+    $result.ProfilePath = $resolvedPath
+
+    try {
+        $items = Get-ChildItem -LiteralPath $resolvedPath -Force -ErrorAction Stop
+        if ($items.Count -le 0) {
+            $result.StatusMessage = "profile path exists but is empty: $resolvedPath"
+            return [pscustomobject]$result
+        }
+    } catch {
+        $result.StatusMessage = "profile path is not accessible: $($_.Exception.Message)"
+        return [pscustomobject]$result
+    }
+
+    $result.IsValid = $true
+    $result.ProfileName = Split-Path -Leaf $resolvedPath
+    return [pscustomobject]$result
+}
+
+function Get-FirefoxProfileCandidates {
+    [CmdletBinding()]
+    param()
+
+    $candidatesByPath = @{}
+    $firefoxAppDataRoot = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'Mozilla\Firefox'
+    $profilesIniPath = Join-Path $firefoxAppDataRoot 'profiles.ini'
+    $profilesRoot = Join-Path $firefoxAppDataRoot 'Profiles'
+
+    function Add-Candidate {
+        param(
+            [string]$CandidatePath,
+            [string]$CandidateName,
+            [string]$Source,
+            [bool]$IsDefault = $false
+        )
+
+        if ([string]::IsNullOrWhiteSpace($CandidatePath)) {
+            return
+        }
+
+        $validation = Test-FirefoxProfilePath -ProfilePath $CandidatePath
+        if (-not $validation.IsValid) {
+            return
+        }
+
+        $candidateKey = $validation.ProfilePath.ToLowerInvariant()
+        if ($candidatesByPath.ContainsKey($candidateKey)) {
+            $existingCandidate = $candidatesByPath[$candidateKey]
+            if ($IsDefault) {
+                $existingCandidate.IsDefault = $true
+            }
+            if ([string]::IsNullOrWhiteSpace($existingCandidate.Name) -and -not [string]::IsNullOrWhiteSpace($CandidateName)) {
+                $existingCandidate.Name = $CandidateName
+            }
+            if ([string]::IsNullOrWhiteSpace($existingCandidate.Source)) {
+                $existingCandidate.Source = $Source
+            } elseif (-not [string]::IsNullOrWhiteSpace($Source) -and $existingCandidate.Source -notmatch [regex]::Escape($Source)) {
+                $existingCandidate.Source = "$($existingCandidate.Source), $Source"
+            }
+            return
+        }
+
+        $displayName = if ([string]::IsNullOrWhiteSpace($CandidateName)) { $validation.ProfileName } else { $CandidateName }
+        $candidatesByPath[$candidateKey] = [pscustomobject]@{
+            Name = $displayName
+            ProfileName = $validation.ProfileName
+            Path = $validation.ProfilePath
+            Source = $Source
+            IsDefault = $IsDefault
+        }
+    }
+
+    function Add-ProfileSection {
+        param(
+            [string]$SectionName,
+            [hashtable]$SectionData
+        )
+
+        if ($SectionName -notlike 'Profile*') {
+            return
+        }
+
+        if (-not $SectionData.ContainsKey('Path')) {
+            return
+        }
+
+        $candidatePath = $SectionData['Path']
+        $isRelative = $true
+        if ($SectionData.ContainsKey('IsRelative') -and $SectionData['IsRelative'] -eq '0') {
+            $isRelative = $false
+        }
+        if ($isRelative) {
+            $candidatePath = Join-Path $firefoxAppDataRoot $candidatePath
+        }
+
+        Add-Candidate -CandidatePath $candidatePath -CandidateName $SectionData['Name'] -Source 'profiles.ini' -IsDefault:($SectionData.ContainsKey('Default') -and $SectionData['Default'] -eq '1')
+    }
+
+    if (Test-Path -LiteralPath $profilesIniPath -PathType Leaf) {
+        try {
+            $currentSectionName = $null
+            $currentSectionData = @{}
+
+            foreach ($line in Get-Content -LiteralPath $profilesIniPath -ErrorAction Stop) {
+                $trimmedLine = $line.Trim()
+
+                if ($trimmedLine -match '^\[(.+)\]$') {
+                    Add-ProfileSection -SectionName $currentSectionName -SectionData $currentSectionData
+                    $currentSectionName = $matches[1]
+                    $currentSectionData = @{}
+                    continue
+                }
+
+                if ([string]::IsNullOrWhiteSpace($trimmedLine) -or $trimmedLine.StartsWith(';') -or -not $currentSectionName) {
+                    continue
+                }
+
+                $keyValue = $trimmedLine -split '=', 2
+                if ($keyValue.Count -ne 2) {
+                    continue
+                }
+
+                $currentSectionData[$keyValue[0].Trim()] = $keyValue[1].Trim()
+            }
+
+            Add-ProfileSection -SectionName $currentSectionName -SectionData $currentSectionData
+        } catch {
+            Write-Warning "Could not inspect Firefox profiles.ini at '$profilesIniPath': $($_.Exception.Message)"
+        }
+    }
+
+    if (Test-Path -LiteralPath $profilesRoot -PathType Container) {
+        try {
+            foreach ($profileDir in Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction Stop) {
+                Add-Candidate -CandidatePath $profileDir.FullName -CandidateName $profileDir.Name -Source 'Profiles folder'
+            }
+        } catch {
+            Write-Warning "Could not inspect Firefox profile folders under '$profilesRoot': $($_.Exception.Message)"
+        }
+    }
+
+    return @(
+        $candidatesByPath.Values |
+            Sort-Object -Property @{ Expression = { if ($_.IsDefault) { 0 } else { 1 } } }, Name, Path
+    )
+}
+
+function Read-ManualFirefoxProfilePath {
+    [CmdletBinding()]
+    param(
+        [string]$DefaultPath
+    )
+
+    while ($true) {
+        $promptSuffix = if ([string]::IsNullOrWhiteSpace($DefaultPath)) { '' } else { " [$DefaultPath]" }
+        $manualPath = Read-Host "Enter the full Firefox profile folder path$promptSuffix"
+
+        if ([string]::IsNullOrWhiteSpace($manualPath)) {
+            if (-not [string]::IsNullOrWhiteSpace($DefaultPath)) {
+                $manualPath = $DefaultPath
+            } else {
+                Write-Warning "Please enter a Firefox profile folder path."
+                continue
+            }
+        }
+
+        $validation = Test-FirefoxProfilePath -ProfilePath $manualPath
+        if ($validation.IsValid) {
+            return $validation.ProfilePath
+        }
+
+        Write-Warning "That Firefox profile path is not usable ($($validation.StatusMessage))."
+    }
+}
+
+function Select-FirefoxProfilePath {
+    [CmdletBinding()]
+    param(
+        [string]$CurrentPath,
+        [string]$CurrentStatusMessage
+    )
+
+    $detectedProfiles = @(Get-FirefoxProfileCandidates)
+
+    Write-Host "`nFirefox profile setup:" -ForegroundColor Magenta
+    if (-not [string]::IsNullOrWhiteSpace($CurrentStatusMessage)) {
+        Write-Host "Current status: $CurrentStatusMessage" -ForegroundColor DarkYellow
+    }
+
+    if ($detectedProfiles.Count -gt 0) {
+        Write-Host "Detected Firefox profiles:" -ForegroundColor Cyan
+        $index = 1
+        foreach ($profile in $detectedProfiles) {
+            $markers = @()
+            if ($profile.IsDefault) {
+                $markers += 'Default'
+            }
+            if (-not [string]::IsNullOrWhiteSpace($CurrentPath) -and $profile.Path -ieq $CurrentPath) {
+                $markers += 'Current'
+            }
+
+            $markerText = if ($markers.Count -gt 0) { " [{0}]" -f ($markers -join ', ') } else { '' }
+            $sourceText = if ([string]::IsNullOrWhiteSpace($profile.Source)) { '' } else { " ($($profile.Source))" }
+            $nameText = if ($profile.Name -and $profile.Name -ne $profile.ProfileName) {
+                "$($profile.Name) [$($profile.ProfileName)]"
+            } else {
+                $profile.ProfileName
+            }
+
+            Write-Host ("{0}. {1}{2}{3}" -f $index, $nameText, $markerText, $sourceText)
+            Write-Host ("    {0}" -f $profile.Path) -ForegroundColor DarkGray
+            $index++
+        }
+    } else {
+        Write-Host "No Firefox profiles were detected automatically." -ForegroundColor DarkYellow
+    }
+
+    Write-Host "M. Enter a profile path manually"
+    Write-Host "S. Skip authentication for now"
+
+    while ($true) {
+        $selectionPrompt = if ($detectedProfiles.Count -gt 0) {
+            "Select a Firefox profile (1-$($detectedProfiles.Count), M, or S)"
+        } else {
+            "Select M to enter a path manually or S to skip"
+        }
+
+        $selection = Read-Host $selectionPrompt
+        $normalizedSelection = if ($null -eq $selection) { '' } else { $selection.Trim() }
+
+        if ($normalizedSelection -match '^[Mm]$') {
+            return [pscustomobject]@{
+                Action = 'UsePath'
+                Path = Read-ManualFirefoxProfilePath -DefaultPath $CurrentPath
+            }
+        }
+
+        if ($normalizedSelection -match '^[Ss]$') {
+            return [pscustomobject]@{
+                Action = 'Skip'
+                Path = $null
+            }
+        }
+
+        $parsedIndex = 0
+        if ($detectedProfiles.Count -gt 0 -and [int]::TryParse($normalizedSelection, [ref]$parsedIndex)) {
+            if ($parsedIndex -ge 1 -and $parsedIndex -le $detectedProfiles.Count) {
+                return [pscustomobject]@{
+                    Action = 'UsePath'
+                    Path = $detectedProfiles[$parsedIndex - 1].Path
+                }
+            }
+        }
+
+        Write-Warning "Please enter a valid selection."
+    }
+}
+
+function Initialize-FirefoxAuthentication {
+    [CmdletBinding()]
+    param()
+
+    $script:authAvailable = $false
+    $script:authType = $null
+    $script:authValue = $null
+    $script:authStatusMessage = $null
+
+    $initialValidation = Test-FirefoxProfilePath -ProfilePath $script:firefoxProfilePath
+    $selectedProfilePath = $script:firefoxProfilePath
+
+    if ($initialValidation.IsValid) {
+        $script:firefoxProfilePath = $initialValidation.ProfilePath
+        Write-Host "Saved Firefox profile: $($script:firefoxProfilePath)" -ForegroundColor DarkGray
+
+        $profilePromptChoice = Read-Host "Press Enter to keep it, C to choose a detected profile, M to enter a new path, or S to skip auth for this run"
+        $normalizedChoice = if ($null -eq $profilePromptChoice) { '' } else { $profilePromptChoice.Trim().ToUpperInvariant() }
+
+        switch ($normalizedChoice) {
+            '' { }
+            'C' {
+                $selectionResult = Select-FirefoxProfilePath -CurrentPath $script:firefoxProfilePath
+                if ($selectionResult.Action -eq 'Skip') {
+                    $script:authStatusMessage = 'authentication skipped for this run'
+                    Write-Warning "Skipping Firefox-cookie authentication for this run. The script will use public-only features."
+                    return
+                }
+                $selectedProfilePath = $selectionResult.Path
+            }
+            'M' {
+                $selectedProfilePath = Read-ManualFirefoxProfilePath -DefaultPath $script:firefoxProfilePath
+            }
+            'S' {
+                $script:authStatusMessage = 'authentication skipped for this run'
+                Write-Warning "Skipping Firefox-cookie authentication for this run. The script will use public-only features."
+                return
+            }
+            default {
+                Write-Warning "Unrecognized choice '$profilePromptChoice'. Keeping the saved Firefox profile."
+            }
+        }
+    } else {
+        if ([string]::IsNullOrWhiteSpace($script:firefoxProfilePath)) {
+            Write-Warning "No Firefox profile is configured for YouTube authentication."
+        } else {
+            Write-Warning "Saved Firefox profile is not usable ($($initialValidation.StatusMessage))."
+        }
+
+        $selectionResult = Select-FirefoxProfilePath -CurrentPath $script:firefoxProfilePath -CurrentStatusMessage $initialValidation.StatusMessage
+        if ($selectionResult.Action -eq 'Skip') {
+            $script:authStatusMessage = if ([string]::IsNullOrWhiteSpace($initialValidation.StatusMessage)) { 'no Firefox profile was selected' } else { $initialValidation.StatusMessage }
+            Write-Warning "No Firefox profile available for YouTube authentication ($($script:authStatusMessage)). The script will use public-only features."
+            return
+        }
+
+        $selectedProfilePath = $selectionResult.Path
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($selectedProfilePath)) {
+        $script:firefoxProfilePath = $selectedProfilePath
+    }
+
+    $finalValidation = Test-FirefoxProfilePath -ProfilePath $script:firefoxProfilePath
+    if (-not $finalValidation.IsValid) {
+        $script:authStatusMessage = $finalValidation.StatusMessage
+        Write-Warning "No Firefox profile available for YouTube authentication ($($script:authStatusMessage)). The script will use public-only features."
+        return
+    }
+
+    $script:firefoxProfilePath = $finalValidation.ProfilePath
+    Save-UserPreferences -firefoxProfilePath $script:firefoxProfilePath
+
+    $script:authType = 'cookies_browser'
+    $script:authValue = "firefox:$($finalValidation.ProfileName)"
+    $script:authAvailable = $true
+    $script:authStatusMessage = "profile ready: $($finalValidation.ProfilePath)"
+    Write-Host "Using authentication: $($script:authType) with value $($script:authValue)" -ForegroundColor Yellow
+}
 
 
 # --- START YT-DLP Nightly Update Check ---
@@ -487,10 +860,10 @@ if (-not $absoluteFfmpegBinPath) {
     }
 }
 
-# Set the argument for yt-dlp if an absolute path was found
+# Set the FFmpeg location value for yt-dlp if an absolute path was found
 if ($absoluteFfmpegBinPath) {
-    # Use the ABSOLUTE path for the argument, enclosed in quotes for the command line
-    $ffmpegLocationArgument = "--ffmpeg-location ""$absoluteFfmpegBinPath"""
+    # Keep only the raw path; PowerShell will preserve it as a single argument.
+    $ffmpegLocationArgument = $absoluteFfmpegBinPath
 } else {
     Write-Warning "FFmpeg location could not be determined. yt-dlp will try to find it in PATH or alongside yt-dlp.exe."
     $ffmpegLocationArgument = "" # Ensure it's empty
@@ -498,42 +871,36 @@ if ($absoluteFfmpegBinPath) {
 
 # --- End FFmpeg Setup Logic ---
 
-# --- Authentication Setup --- 
-# Hardcoding authentication using the full profile PATH
-$firefoxProfilePath = "$env:USERPROFILE\AppData\Roaming\Mozilla\Firefox\Profiles\fw0m6kre.default-nightly" # !!! UPDATED WITH USER PATH !!!
-
-# Determine whether authentication via Firefox cookies is available
-$script:authAvailable = $false
-$authType = $null
-$authValue = $null
-
-$authStatusMessage = $null
-if ([string]::IsNullOrWhiteSpace($firefoxProfilePath)) {
-    $authStatusMessage = 'profile path is empty or not set'
-} elseif (-not (Test-Path $firefoxProfilePath -PathType Container)) {
-    $authStatusMessage = "profile path does not exist: $firefoxProfilePath"
-} else {
-    try {
-        # Check accessibility and that the directory is not empty
-        $items = Get-ChildItem -Path $firefoxProfilePath -Force -ErrorAction Stop
-        if ($items.Count -gt 0) {
-            $profileFolderName = Split-Path -Leaf $firefoxProfilePath
-            $authType = 'cookies_browser'
-            $authValue = "firefox:$profileFolderName"
-            $script:authAvailable = $true
-            Write-Host "Using authentication: $authType with value $authValue" -ForegroundColor Yellow
-        } else {
-            $authStatusMessage = "profile path exists but is empty: $firefoxProfilePath"
-        }
-    } catch {
-        $authStatusMessage = "profile path is not accessible: $($_.Exception.Message)"
-    }
-}
-
-if (-not $script:authAvailable) {
-    Write-Warning "No Firefox profile available for YouTube authentication ($authStatusMessage). The script will use public-only features."
-}
+# --- Authentication Setup ---
+Initialize-FirefoxAuthentication
+$authType = $script:authType
+$authValue = $script:authValue
 # --- End Authentication Setup ---
+
+function Get-YtDlpJsRuntimeArgument {
+    [CmdletBinding()]
+    param()
+
+    $runtimeCandidates = @(
+        @{ Command = 'deno'; Runtime = 'deno'; Label = 'Deno' },
+        @{ Command = 'node'; Runtime = 'node'; Label = 'Node.js' },
+        @{ Command = 'bun'; Runtime = 'bun'; Label = 'Bun' },
+        @{ Command = 'qjs'; Runtime = 'quickjs'; Label = 'QuickJS' }
+    )
+
+    foreach ($candidate in $runtimeCandidates) {
+        $commandInfo = Get-Command $candidate.Command -ErrorAction SilentlyContinue
+        if ($commandInfo) {
+            Write-Host "Using JavaScript runtime for yt-dlp challenges: $($candidate.Label) ($($commandInfo.Source))" -ForegroundColor DarkGray
+            return $candidate.Runtime
+        }
+    }
+
+    Write-Warning "No supported JavaScript runtime was found for yt-dlp YouTube challenges. Install Deno (recommended) or Node.js 20+ if you hit missing-format errors."
+    return $null
+}
+
+$ytDlpJsRuntimeArgument = Get-YtDlpJsRuntimeArgument
 
 # --- Download Functions ---
 # Archive and outputs now live under the download root
@@ -581,9 +948,10 @@ function Download-BestVideo {
     
     # Build Argument List
     $ArgumentList = @()
-    if ($ffmpegLocationArg) { $ArgumentList += $ffmpegLocationArg.Split(' ', 2) }
+    if ($ffmpegLocationArg) { $ArgumentList += '--ffmpeg-location', $ffmpegLocationArg }
+    if ($ytDlpJsRuntimeArgument) { $ArgumentList += '--js-runtimes', $ytDlpJsRuntimeArgument }
     if ($commonArgs) { $ArgumentList += $commonArgs }
-    $ArgumentList += '--download-archive', "`"$archivePath`""
+    $ArgumentList += '--download-archive', $archivePath
     if ($authTypeValue -eq 'cookies_browser' -and $authPathValue) {
         $ArgumentList += '--cookies-from-browser'
         $ArgumentList += $authPathValue
@@ -644,6 +1012,7 @@ function Download-Playlist {
 
     # Build arg list for prefetch
     $prefetchArgList = @()
+    if ($ytDlpJsRuntimeArgument) { $prefetchArgList += '--js-runtimes', $ytDlpJsRuntimeArgument }
     if ($authTypeValue -eq 'cookies_browser' -and $authPathValue) {
         $prefetchArgList += '--cookies-from-browser'
         $prefetchArgList += $authPathValue # Now contains "firefox:profilename"
@@ -729,16 +1098,16 @@ function Download-Playlist {
 
     # Argument List for the main download
     $mainArgList = @()
-    if ($ffmpegLocationArg) { $mainArgList += $ffmpegLocationArg.Split(' ', 2) }
+    if ($ffmpegLocationArg) { $mainArgList += '--ffmpeg-location', $ffmpegLocationArg }
+    if ($ytDlpJsRuntimeArgument) { $mainArgList += '--js-runtimes', $ytDlpJsRuntimeArgument }
     if ($commonArgs) { $mainArgList += $commonArgs }
-    $mainArgList += '--download-archive', "`"$archivePath`""
+    $mainArgList += '--download-archive', $archivePath
     if ($authTypeValue -eq 'cookies_browser' -and $authPathValue) {
         $mainArgList += '--cookies-from-browser'
         $mainArgList += $authPathValue
     }
     
-    # Add output template with proper quoting for Windows paths
-    $mainArgList += '--output', "`"$templateDir/%(title)s [%(id)s].%(ext)s`""
+    $mainArgList += '--output', "$templateDir/%(title)s [%(id)s].%(ext)s"
     
     $mainArgList += $playlistUrl
 
@@ -788,7 +1157,8 @@ function Download-Playlist {
             }
             $sidecarTemplateDir = $sidecarOutputDir.Replace('\\', '/')
             $metaArgList = @()
-            if ($ffmpegLocationArg) { $metaArgList += $ffmpegLocationArg.Split(' ', 2) }
+            if ($ffmpegLocationArg) { $metaArgList += '--ffmpeg-location', $ffmpegLocationArg }
+            if ($ytDlpJsRuntimeArgument) { $metaArgList += '--js-runtimes', $ytDlpJsRuntimeArgument }
             # Authentication if available
             if ($authTypeValue -eq 'cookies_browser' -and $authPathValue) {
                 $metaArgList += '--cookies-from-browser'
@@ -802,7 +1172,7 @@ function Download-Playlist {
             $metaArgList += '--convert-subs', 'srt'
             $metaArgList += '--sub-langs', 'en.*,en'
             # Output template to sidecar folder
-            $metaArgList += '--output', "`"$sidecarTemplateDir/%(title)s [%(id)s].%(ext)s`""
+            $metaArgList += '--output', "$sidecarTemplateDir/%(title)s [%(id)s].%(ext)s"
             $metaArgList += $playlistUrl
 
             try {
@@ -949,6 +1319,7 @@ function Get-MyPlaylistsAndDownload {
         
         # Build Argument list for listing playlists
         $listArgList = @()
+        if ($ytDlpJsRuntimeArgument) { $listArgList += '--js-runtimes', $ytDlpJsRuntimeArgument }
         $listArgList += '--cookies-from-browser'
         $listArgList += $authPathValue # Now contains "firefox:profilename"
         $listArgList += '-J', '--flat-playlist', $feedUrl
@@ -1171,8 +1542,8 @@ if ($script:authAvailable) {
     Write-Host "3. List & Download My Playlist (Requires Auth)"
     Write-Host "4. List & Download My Playlist (Refresh Cache)"
 } else {
-    Write-Host "3. List & Download My Playlist (Requires Auth) - Unavailable (missing Firefox profile)" -ForegroundColor DarkGray
-    Write-Host "4. List & Download My Playlist (Refresh Cache) - Unavailable (missing Firefox profile)" -ForegroundColor DarkGray
+    Write-Host "3. List & Download My Playlist (Requires Auth) - Unavailable (Firefox auth unavailable)" -ForegroundColor DarkGray
+    Write-Host "4. List & Download My Playlist (Refresh Cache) - Unavailable (Firefox auth unavailable)" -ForegroundColor DarkGray
 }
 
 $defaultChoice = if ($script:lastChoice) { $script:lastChoice } else { "" }
@@ -1211,7 +1582,7 @@ try {
         }
         "3" {
             if (-not $script:authAvailable) {
-                Write-Warning "Option 3 is unavailable because a valid Firefox profile with YouTube cookies was not found. Running in public-only mode."
+                Write-Warning "Option 3 is unavailable because Firefox-cookie authentication is not available. Running in public-only mode."
                 break
             }
             Write-Host "Selected: List & Download My Playlist" -ForegroundColor Yellow
@@ -1219,7 +1590,7 @@ try {
         }
         "4" {
             if (-not $script:authAvailable) {
-                Write-Warning "Option 4 is unavailable because a valid Firefox profile with YouTube cookies was not found. Running in public-only mode."
+                Write-Warning "Option 4 is unavailable because Firefox-cookie authentication is not available. Running in public-only mode."
                 break
             }
             Write-Host "Selected: List & Download My Playlist (Force Refresh Cache)" -ForegroundColor Yellow

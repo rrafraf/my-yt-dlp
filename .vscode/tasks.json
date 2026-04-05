@@ -23,7 +23,7 @@
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        "${workspaceFolder}\\yt-research-gui.ps1"
+        "${workspaceFolder}\\yt-research-gui\\yt-research-gui.ps1"
       ],
       "problemMatcher": []
     }

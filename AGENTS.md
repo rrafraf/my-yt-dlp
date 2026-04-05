@@ -5,11 +5,11 @@ This file defines project-specific guidance for coding agents working in this re
 ## Project Purpose
 - Windows-focused tooling around `yt-dlp` for:
 - interactive YouTube download workflows (`yt-dlp-helper.ps1`)
-- YouTube research GUI (`yt-research-gui.ps1`)
+- YouTube research GUI (`yt-research-gui\yt-research-gui.ps1`)
 - audio transcription helper (`whatsapp_transcribe.py`)
 
 ## Repo Boundaries
-- Treat `yt-dlp-helper.ps1` and `yt-research-gui.ps1` as distinct tools.
+- Treat `yt-dlp-helper.ps1` and `yt-research-gui\yt-research-gui.ps1` as distinct tools.
 - Do not change both in one task unless the user explicitly asks or a shared contract requires it.
 - Keep changes minimal and targeted to the request.
 
@@ -43,7 +43,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\yt-dlp-helper.ps1
 ```
 - Run GUI:
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\yt-research-gui.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\yt-research-gui\yt-research-gui.ps1
 ```
 
 ## Git/Commit Expectations

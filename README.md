@@ -11,8 +11,8 @@ A Windows-focused toolkit to:
 
 ### WhatвЂ™s in this repo
 - `yt-dlp-helper.ps1`: Entry point. Interactive menu for YouTube downloads and auto-setup of tools.
-- `user_preferences.json`: Stores last menu choice, playlist info, and current `yt-dlp` version.
-- `yt-research-gui.ps1`: Top-level launcher for the research GUI.
+- `user_preferences.json`: Stores last menu choice, playlist info, current `yt-dlp` version, and your saved Firefox profile path.
+- `yt-research-gui\yt-research-gui.ps1`: Launcher for the research GUI.
 - `yt-research-gui/`: Dedicated folder for the GUI implementation, config, Python project, logs, and cached transcript data.
 - `ffmpeg_yt-dlp/`: Folder where the portable FFmpeg is downloaded and extracted.
 - `cache/`: Caches your YouTube playlists listing (`playlists_cache.json`).
@@ -26,8 +26,10 @@ A Windows-focused toolkit to:
 - Windows 10/11
 - PowerShell 5.0+
 - Internet access (downloads yt-dlp nightly release and FFmpeg builds)
+- For reliable YouTube format extraction:
+  - A supported JavaScript runtime for `yt-dlp` challenge solving, such as Deno or Node.js 20+. The helper auto-detects and passes an available runtime.
 - For playlist listing/authenticated downloads:
-  - Firefox (Nightly or regular). You must point the script to your Firefox profile folder.
+  - Firefox (Nightly or regular). The helper can scan for local Firefox profiles and save your chosen profile path in `user_preferences.json`.
 - For on-demand GUI Whisper transcription:
   - `uv` installed
   - Python 3.10+ (managed through `uv` in `yt-research-gui/`)
@@ -44,13 +46,12 @@ A Windows-focused toolkit to:
 
 ### 1) Get your Firefox profile path (for cookies)
 If you want to list/download your own playlists:
-1. Open Firefox and go to `about:profiles`.
-2. Find the profile you use for YouTube logins.
-3. Copy the absolute folder path.
-4. Edit `yt-dlp-helper.ps1` and set the variable `\$firefoxProfilePath` to that folder. Example in the script:
-   - `C:\Users\<you>\AppData\Roaming\Mozilla\Firefox\Profiles\<profile>.default` (or Nightly variant)
+1. Run `yt-dlp-helper.ps1`.
+2. If no Firefox profile is saved yet, or the saved one no longer exists, the helper will scan your system for Firefox profiles and list them as choices.
+3. Pick one of the detected profiles, or choose the manual-entry option and paste the absolute profile folder path yourself.
+4. The selected path is saved in `user_preferences.json` for future runs.
 
-If the profile path is wrong, the script will exit with a clear error and tell you to fix it.
+If you need to verify the path manually first, open Firefox and go to `about:profiles`, then copy the absolute folder path for the profile you use for YouTube logins.
 
 ### 2) Allow running the script (if needed)
 If your execution policy blocks local scripts, run PowerShell as your user and execute:
@@ -86,7 +87,7 @@ cd "C:\Users\<you>\Documents\GitHub\my-yt-dlp"
 ### Download root and per-location preferences
 - On start, the helper now asks for a download root path. The choice is remembered.
 - Each download root keeps its own `user_preferences.json` and `download_archive.txt` inside that path, so you can maintain separate contexts for different drives/folders.
-- A global `user_preferences.json` in the project stores the last used download root and the current `yt-dlp` version.
+- A global `user_preferences.json` in the project stores the last used download root, the current `yt-dlp` version, and the saved Firefox profile path.
 
 ### GUI logging configuration
 `yt-research-gui\yt-research-gui.ps1` reads logging settings from `yt-research-gui\yt-research-gui.config.json`:
@@ -109,7 +110,7 @@ uv sync
 ```
 
 ### GUI on-demand Whisper fallback
-- The Transcript tab in `yt-research-gui.ps1` now exposes a `Transcribe with Whisper` button even when YouTube subtitles/auto-subs were found.
+- The Transcript tab in `yt-research-gui\yt-research-gui.ps1` now exposes a `Transcribe with Whisper` button even when YouTube subtitles/auto-subs were found.
 - Whisper runs in the background and the Transcript tab shows a live activity pane plus progress text while it works.
 - The GUI still auto-detects your Firefox profile path, but `Use Firefox cookies` starts unchecked by default.
 - If a cookie-backed YouTube request fails with the `not available on this app` error, the GUI automatically retries that request without Firefox cookies.
@@ -132,7 +133,8 @@ uv sync
 ### Authentication details (cookies)
 - The script extracts your Firefox profile folder name and passes it to `yt-dlp` as:
   - `--cookies-from-browser firefox:<profileName>`
-- Change `\$firefoxProfilePath` inside `yt-dlp-helper.ps1` to match your system.
+- The full Firefox profile path is stored locally in `user_preferences.json`.
+- On startup, the helper validates the saved path. You can keep it, choose a newly detected profile, or paste a different path manually.
 
 ### Playlist listing and cache
 - Listing your playlists uses the YouTube feed URL and cookies
@@ -179,7 +181,8 @@ Notes:
 ---
 
 ## Troubleshooting
-- Firefox profile path error: Re-check `about:profiles` and update `\$firefoxProfilePath` in `yt-dlp-helper.ps1`.
+- Firefox profile path error: Re-run the helper and choose one of the detected Firefox profiles, or re-check `about:profiles` and paste the correct path when prompted.
+- `n challenge solving failed` / `Requested format is not available`: install Deno or Node.js 20+, then re-run the helper. It will auto-detect the runtime and pass `--js-runtimes` to `yt-dlp`.
 - Corporate proxy/GitHub API issues: The helper will proceed with an existing local `yt-dlp.exe` if it canвЂ™t reach GitHub; otherwise it will stop with an error.
 - Script execution blocked: Use `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` for your current session.
 - Whisper install issues on Windows: Ensure Visual C++ Build Tools are installed if compilation is required, or use prebuilt wheels for Torch as shown above.
@@ -187,7 +190,7 @@ Notes:
 ---
 
 ## FAQ
-- Can I use a non-Nightly Firefox? Yes. Point `\$firefoxProfilePath` to the profile you actually use; the script only needs the folder name to pass to `yt-dlp`.
+- Can I use a non-Nightly Firefox? Yes. Choose the profile you actually use in the helper prompt; the script only needs the folder name to pass to `yt-dlp`.
 - Where is `yt-dlp.exe` stored? In the repo root alongside the script, updated from the nightly builds.
 - How do I avoid re-downloading the same videos? The helper uses `--download-archive download_archive.txt` automatically. 
 

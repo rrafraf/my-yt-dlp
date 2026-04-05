@@ -13,7 +13,7 @@
       "name": "Launch yt-research GUI",
       "type": "PowerShell",
       "request": "launch",
-      "script": "${workspaceFolder}\\yt-research-gui.ps1",
+      "script": "${workspaceFolder}\\yt-research-gui\\yt-research-gui.ps1",
       "cwd": "${workspaceFolder}",
       "createTemporaryIntegratedConsole": true
     },
