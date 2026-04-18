@@ -14,9 +14,10 @@ A Windows-focused toolkit to:
 - `yt-dlp-helper/`: Dedicated folder for the helper implementation, its local state, cache, and default downloads.
 - `yt-research-gui\yt-research-gui.ps1`: Launcher for the research GUI.
 - `yt-research-gui/`: Dedicated folder for the GUI implementation, config, Python project, logs, and cached transcript data.
+- `tools/whisper_transcribe_core/`: Shared Whisper transcription core used by both the GUI and the WhatsApp transcription tool.
 - `ffmpeg_yt-dlp/`: Shared portable FFmpeg used by both the helper and the GUI.
 - `yt-dlp.exe`: Shared `yt-dlp` executable used by both the helper and the GUI.
-- `whatsapp_transcribe.py`: Batch transcribes WhatsApp `.opus` files using FFmpeg + OpenAI Whisper.
+- `tools\whatsapp_transcribe\whatsapp_transcribe.py`: Batch transcribes WhatsApp `.opus` files using FFmpeg + OpenAI Whisper.
 - `Transcripts/`: Output folder for transcription results (created on demand).
 - `_tbt_audios/`: Place WhatsApp `.opus` files here for transcription.
 
@@ -35,6 +36,10 @@ A Windows-focused toolkit to:
   - Python 3.10+ (managed through `uv` in `yt-research-gui/`)
   - FFmpeg available under `ffmpeg_yt-dlp/` (installed by the helper script)
   - GUI Python dependencies installed with `uv sync` inside `yt-research-gui/`
+- For GUI Gemma 4 transcript post-processing:
+  - Ollama installed locally
+  - Ollama running with the local API available at `http://127.0.0.1:11434`
+  - A local `gemma4` model pulled into Ollama, or a different model name configured in `yt-research-gui.config.json`
 - For WhatsApp transcription:
   - Python 3.9+ recommended
   - FFmpeg (auto-installed into `ffmpeg_yt-dlp` by the helper script, used by the Python script)
@@ -92,17 +97,26 @@ cd "C:\Users\<you>\Documents\GitHub\my-yt-dlp"
 ### GUI logging configuration
 `yt-research-gui\yt-research-gui.ps1` reads logging settings from `yt-research-gui\yt-research-gui.config.json`:
 ```json
-"logging": {
-  "level": "INFO",
-  "retentionDays": 14
+{
+  "logging": {
+    "level": "INFO",
+    "retentionDays": 14
+  },
+  "ollama": {
+    "model": "gemma4",
+    "timeoutSeconds": 180
+  }
 }
 ```
 - `level`: one of `DEBUG`, `INFO`, `WARN`, `ERROR`.
 - `retentionDays`: keep only log entries newer than this many days at startup (set `0` to disable trimming).
+- `ollama.model`: local Ollama model name used for transcript post-processing.
+- `ollama.timeoutSeconds`: request timeout for the local Ollama API.
 
 ### GUI Python project
 - The GUI now has a dedicated `uv` project in `yt-research-gui/`.
-- The Whisper helper package lives under `yt-research-gui/src/yt_research_gui_whisper/`.
+- The GUI Whisper wrapper lives under `yt-research-gui/src/yt_research_gui_whisper/`.
+- The actual Whisper transcription core is shared at `tools/whisper_transcribe_core/`.
 - To refresh the GUI Python environment manually:
 ```powershell
 cd .\yt-research-gui
@@ -116,7 +130,21 @@ uv sync
 - If a cookie-backed YouTube request fails with the `not available on this app` error, the GUI automatically retries that request without Firefox cookies.
 - The GUI keeps extracted audio in `yt-research-gui/data/audio/<videoId>.wav`.
 - The GUI keeps local transcript text in `yt-research-gui/data/transcripts/<videoId>.txt`.
+- The GUI keeps local Whisper timing metadata in `yt-research-gui/data/transcripts/<videoId>.timings.json` and exposes it in a `Transcript Timing` tab.
 - If a local Whisper transcript already exists for that video ID, the button changes to `Load Whisper Transcript` and reuses the cached file.
+
+### GUI Gemma 4 transcript post-processing
+- The Transcript tab now includes a preset picker plus a `Run Gemma 4` button for post-processing the currently loaded transcript text.
+- Built-in presets are:
+  - `Clean Transcript`
+  - `Dialogue Analysis`
+  - `Notes and Summary`
+- Gemma 4 processing is a post-transcript step only. It uses the current transcript text from YouTube subtitles or the latest Whisper result.
+- Results are shown in a separate `Gemma Result` panel beside the transcript text.
+- Gemma 4 runs in the background through the reusable helper in `tools\local_llm_text\`.
+- Cached Gemma results are stored under `yt-research-gui/data/llm-results/<videoId>/`.
+- Cache keys include the model, preset, and transcript hash, so updating the transcript causes a fresh Gemma run instead of reusing stale output.
+- If a matching cached result exists, the GUI loads it immediately without calling Ollama again.
 
 ### Where downloads go and what gets saved
 - Default output root: `yt-dlp-helper/Downloads/`
@@ -160,17 +188,18 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 ### Run
 ```powershell
-python .\whatsapp_transcribe.py
+python .\tools\whatsapp_transcribe\whatsapp_transcribe.py
 ```
 
 ### Outputs
 - WAV files: `Transcripts/wav_files/<original>.wav`
 - Per-audio transcript: `Transcripts/<original>.txt`
+- Per-audio Whisper timing metadata: `Transcripts/<original>.timings.json`
 - Combined transcript: `Transcripts/_combined_transcript.txt`
 
 Notes:
 - The script temporarily adds the FFmpeg `bin` folder to `PATH` so Whisper (and FFmpeg) can run cleanly on Windows.
-- Default Whisper model is `turbo` and language is set to English. Edit the top of `whatsapp_transcribe.py` to change.
+- Default Whisper model is `turbo` and language is set to English. Edit the top of `tools\whatsapp_transcribe\whatsapp_transcribe.py` to change.
 
 ---
 
@@ -187,6 +216,8 @@ Notes:
 - Corporate proxy/GitHub API issues: The helper will proceed with an existing local `yt-dlp.exe` if it canвЂ™t reach GitHub; otherwise it will stop with an error.
 - Script execution blocked: Use `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` for your current session.
 - Whisper install issues on Windows: Ensure Visual C++ Build Tools are installed if compilation is required, or use prebuilt wheels for Torch as shown above.
+- Gemma 4 helper says Ollama is unavailable: Start Ollama and confirm the local API responds on `127.0.0.1:11434`, then re-run the preset from the Transcript tab.
+- Gemma 4 request times out: increase `ollama.timeoutSeconds` in `yt-research-gui.config.json`, or switch the GUI to a lighter local Ollama model by changing `ollama.model`.
 
 ---
 

@@ -938,18 +938,83 @@ $ytDlpJsRuntimeArgument = Get-YtDlpJsRuntimeArgument
 
 # Core flags shared by all commands (archive is injected per-call for concurrency safety)
 $commonFlagsCore = @(
-    '-f', 'bv*+ba/b',
-    '--sub-langs', 'en.*,en',
-    '--write-subs',
-    '--write-auto-subs',
-    '--convert-subs', 'srt',
-    '--embed-metadata',
-    '--embed-subs',
-    '--merge-output-format', 'mkv',
-    '--no-write-description',
-    '--no-write-info-json',
-    '--no-write-thumbnail',
-    '--progress-delta', '2'
+    '-f', 'bv*+ba/b',                  # Prefer best separate video + best audio and merge them;
+                                      # if that is not available, fall back to a single best combined format.
+                                      # Good default for quality-focused downloads. :contentReference[oaicite:1]{index=1}
+
+    '--sub-langs', 'en.*,en',          # Request English subtitles. Regex allows variants like en-US, en-GB, etc.
+                                      # Useful when videos offer multiple English subtitle tracks. :contentReference[oaicite:2]{index=2}
+
+    # '--write-subs',                  # Download regular/manual subtitles.
+                                      # Needed if you want actual subtitle tracks when they exist.
+
+    # '--write-auto-subs',             # Download auto-generated subtitles too.
+                                      # Useful on YouTube when no human-made subtitles are available.
+
+    #'--convert-subs', 'srt',          # Convert downloaded subtitles to SRT.
+                                      # Good for external subtitle workflows; less necessary if you only embed.
+
+    '--embed-metadata',                # Write metadata into the media container.
+                                      # Can also embed chapters, and attach infojson in some cases unless disabled. :contentReference[oaicite:3]{index=3}
+
+    '--embed-subs',                    # Embed subtitles into the final media file.
+                                      # Works with mp4/webm/mkv. Only useful when subs were actually downloaded. :contentReference[oaicite:4]{index=4}
+
+    '--merge-output-format', 'mkv',    # When separate streams must be merged, prefer MKV as the output container.
+                                      # Ignored if no merge is needed. MKV is flexible and subtitle-friendly. :contentReference[oaicite:5]{index=5}
+
+    '--no-write-description',          # Do not save a separate .description text file. :contentReference[oaicite:6]{index=6}
+    '--no-write-info-json',            # Do not save a separate .info.json metadata file. :contentReference[oaicite:7]{index=7}
+    '--no-write-thumbnail',            # Do not save thumbnail image files to disk. :contentReference[oaicite:8]{index=8}
+
+    '--progress-delta', '2'            # Update progress output every 2 seconds.
+                                      # Helps keep console output less noisy. :contentReference[oaicite:9]{index=9}
+
+    # ----------------------------
+    # Useful additions to consider
+    # ----------------------------
+
+    # '--embed-thumbnail',             # Embed thumbnail/cover art into the media file.
+                                      # Nice for media library players; separate from writing thumbnail to disk. :contentReference[oaicite:10]{index=10}
+
+    # '--embed-chapters',              # Embed chapter markers into the output file.
+                                      # Useful for YouTube videos with chapter timestamps. :contentReference[oaicite:11]{index=11}
+
+    # '--cookies-from-browser', 'brave', # Import login/session cookies from browser.
+                                        # Very useful for age-restricted, member-only, or otherwise gated content. :contentReference[oaicite:12]{index=12}
+
+    # '--download-archive', 'archive.txt', # Skip videos already downloaded before.
+                                           # Extremely useful for channel/playlist syncing.
+
+    # '--concurrent-fragments', '4',   # Download multiple fragments in parallel for fragmented streams.
+                                      # Can speed things up on some sites.
+
+    # '--trim-filenames', '180',       # Prevent very long filenames from getting unwieldy on Windows.
+
+    # '--paths', 'home:D:\Downloads\yt-dlp', # Put all outputs under a known base folder.
+                                            # Helps keep metadata/subtitle/temp files organized.
+
+    # '-o', '%(uploader)s\%(playlist|NA)s\%(title)s [%(id)s].%(ext)s',
+                                      # Strongly recommended output template for organization and avoiding collisions.
+
+    # '--restrict-filenames',          # Safer filenames for scripts / cross-platform use.
+                                      # Helpful if titles contain strange characters.
+
+    # '--abort-on-error',              # Stop the whole run on first failure instead of continuing.
+                                      # Better when consistency matters more than partial success. :contentReference[oaicite:13]{index=13}
+
+    # '--write-info-json',             # Save sidecar metadata JSON.
+                                      # Very useful for archival workflows, parsing later, or reproducibility. :contentReference[oaicite:14]{index=14}
+
+    # '--write-thumbnail',             # Save thumbnails as separate files.
+                                      # Useful if you build a media archive or want local poster art. :contentReference[oaicite:15]{index=15}
+
+    # '--sponsorblock-remove', 'all',  # On supported sites, remove sponsor/self-promo segments.
+                                      # Useful for personal offline playback.
+
+    # '--live-from-start',             # For supported livestream sites, capture from the beginning. :contentReference[oaicite:16]{index=16}
+
+    # '--wait-for-video', '300',       # Wait/retry for scheduled streams or not-yet-live videos. :contentReference[oaicite:17]{index=17}
 )
 
 

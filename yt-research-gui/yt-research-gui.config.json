@@ -2,5 +2,9 @@
     "logging": {
         "level": "INFO",
         "retentionDays": 14
+    },
+    "ollama": {
+        "model": "gemma4",
+        "timeoutSeconds": 180
     }
 }
