@@ -5,6 +5,10 @@ from pathlib import Path
 from typing import Any
 
 
+def get_default_cache_root() -> Path:
+    return Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+
+
 def configure_stdio() -> None:
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
@@ -30,7 +34,12 @@ def add_ffmpeg_to_path(ffmpeg_dir: str) -> None:
         os.environ["PATH"] = str(ffmpeg_path) + os.pathsep + current_path
 
 
-def load_whisper_model(model_name: str):
+def get_whisper_model_cache_dir(download_root: str | Path | None = None) -> Path:
+    cache_dir = Path(download_root) if download_root else get_default_cache_root() / "whisper"
+    return cache_dir.expanduser().resolve()
+
+
+def load_whisper_model(model_name: str, download_root: str | Path | None = None):
     try:
         import whisper
     except Exception as exc:
@@ -38,7 +47,9 @@ def load_whisper_model(model_name: str):
             "Python package 'openai-whisper' is not installed. Install it before using Whisper transcription."
         ) from exc
 
-    return whisper.load_model(model_name)
+    cache_dir = get_whisper_model_cache_dir(download_root)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return whisper.load_model(model_name, download_root=str(cache_dir))
 
 
 def sanitize_word(word: dict[str, Any]) -> dict[str, Any]:

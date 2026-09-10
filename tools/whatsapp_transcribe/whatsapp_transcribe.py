@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools.whisper_transcribe_core.core import (
     add_ffmpeg_to_path,
+    get_whisper_model_cache_dir,
     load_whisper_model,
     transcribe_audio,
     write_transcription_outputs,
@@ -140,7 +141,8 @@ def main():
         chosen_model_name = select_whisper_model()
         print(f"Using Whisper model: '{chosen_model_name}'")
 
-        print(f"\nLoading Whisper model '{chosen_model_name}'...")
+        model_cache_dir = get_whisper_model_cache_dir()
+        print(f"\nLoading Whisper model '{chosen_model_name}' from '{model_cache_dir}'...")
         print("(This may take a while, especially on first download...)")
         load_start_time = time.time()
         try:

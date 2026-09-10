@@ -23,21 +23,30 @@ $script:logLevels = @{
     WARN  = 30
     ERROR = 40
 }
+$script:utf8NoBomEncoding = New-Object System.Text.UTF8Encoding($false)
 $script:currentLogLevel = 'INFO'
 $script:logRetentionDays = 14
 $script:guiDataRoot = Join-Path $PSScriptRoot 'data'
 $script:guiAudioDir = Join-Path $script:guiDataRoot 'audio'
 $script:guiTranscriptDir = Join-Path $script:guiDataRoot 'transcripts'
 $script:guiLlmResultDir = Join-Path $script:guiDataRoot 'llm-results'
+$script:guiTranscriptStudioDir = Join-Path $script:guiDataRoot 'transcript-studio'
+$script:guiBundleDir = Join-Path $script:guiDataRoot 'video-bundles'
 $script:guiPythonProjectRoot = $PSScriptRoot
 $script:guiWhisperModule = 'yt_research_gui_whisper'
 $script:guiWhisperApp = 'yt-research-gui-whisper'
 $script:guiWhisperModel = 'turbo'
 $script:guiWhisperLanguage = 'en'
+$script:ollamaChunkPrefix = '[[OLLAMA_CHUNK_BASE64]]'
+$script:ollamaCacheVersion = 'v2'
 $script:localLlmToolRoot = Join-Path $script:repoRoot 'tools\local_llm_text'
 $script:localLlmToolScript = Join-Path $script:localLlmToolRoot 'cli.py'
+$script:transcriptStudioProjectRoot = Join-Path $script:repoRoot 'tools\transcript_studio'
+$script:transcriptStudioModule = 'transcript_studio.cli'
+$script:transcriptStudioApp = 'transcript-studio'
 $script:ollamaModel = 'gemma4'
 $script:ollamaTimeoutSeconds = 180
+$script:ollamaModels = @()
 $script:activeWhisperProcess = $null
 $script:activeWhisperStdOutPath = ''
 $script:activeWhisperStdErrPath = ''
@@ -46,6 +55,7 @@ $script:activeWhisperTimingPath = ''
 $script:activeWhisperAudioPath = ''
 $script:activeWhisperVideoId = ''
 $script:activeWhisperOutputSummary = ''
+$script:activeWhisperBundleRunId = ''
 $script:whisperPollTimer = $null
 $script:activeGemmaProcess = $null
 $script:activeGemmaStdOutPath = ''
@@ -54,10 +64,14 @@ $script:activeGemmaResultPath = ''
 $script:activeGemmaInputPath = ''
 $script:activeGemmaVideoId = ''
 $script:activeGemmaPresetId = ''
+$script:activeGemmaModel = ''
 $script:activeGemmaTranscriptHash = ''
+$script:activeGemmaBundleRunId = ''
 $script:gemmaPollTimer = $null
 $script:gemmaPresets = @()
 $script:gemmaHelperAvailable = $false
+
+. (Join-Path $PSScriptRoot 'processing_bundle.ps1')
 
 function Load-LoggingSettings {
     $script:currentLogLevel = 'INFO'
@@ -573,7 +587,7 @@ function Get-GuiGemmaResultPath {
     )
 
     $cacheDir = Get-GuiGemmaCacheDirectory -VideoId $VideoId
-    $fileName = '{0}--{1}--{2}.json' -f (ConvertTo-SafeCacheSegment -Value $Model), (ConvertTo-SafeCacheSegment -Value $PresetId), $TranscriptHash
+    $fileName = '{0}--{1}--{2}--{3}.json' -f $script:ollamaCacheVersion, (ConvertTo-SafeCacheSegment -Value $Model), (ConvertTo-SafeCacheSegment -Value $PresetId), $TranscriptHash
     return (Join-Path $cacheDir $fileName)
 }
 
@@ -586,8 +600,38 @@ function Get-GuiGemmaInputPath {
     )
 
     $cacheDir = Get-GuiGemmaCacheDirectory -VideoId $VideoId
-    $fileName = '{0}--{1}--{2}.input.txt' -f (ConvertTo-SafeCacheSegment -Value $Model), (ConvertTo-SafeCacheSegment -Value $PresetId), $TranscriptHash
+    $fileName = '{0}--{1}--{2}--{3}.input.txt' -f $script:ollamaCacheVersion, (ConvertTo-SafeCacheSegment -Value $Model), (ConvertTo-SafeCacheSegment -Value $PresetId), $TranscriptHash
     return (Join-Path $cacheDir $fileName)
+}
+
+function New-OllamaModelEntry {
+    param(
+        [string]$Model,
+        [string]$Display,
+        [string]$Family = '',
+        [string]$ParameterSize = '',
+        [string]$QuantizationLevel = '',
+        [string]$Source = 'ollama'
+    )
+
+    $resolvedModel = ([string]$Model).Trim()
+    if ([string]::IsNullOrWhiteSpace($resolvedModel)) {
+        return $null
+    }
+
+    $resolvedDisplay = ([string]$Display).Trim()
+    if ([string]::IsNullOrWhiteSpace($resolvedDisplay)) {
+        $resolvedDisplay = $resolvedModel
+    }
+
+    return [pscustomobject]@{
+        model             = $resolvedModel
+        display           = $resolvedDisplay
+        family            = ([string]$Family).Trim()
+        parameterSize     = ([string]$ParameterSize).Trim()
+        quantizationLevel = ([string]$QuantizationLevel).Trim()
+        source            = ([string]$Source).Trim()
+    }
 }
 
 function Write-TextFileUtf8 {
@@ -597,25 +641,30 @@ function Write-TextFileUtf8 {
     )
 
     Ensure-DirectoryExists -Path (Split-Path -Parent $Path)
-    [System.IO.File]::WriteAllText($Path, [string]$Text, [System.Text.Encoding]::UTF8)
+    [System.IO.File]::WriteAllText($Path, [string]$Text, $script:utf8NoBomEncoding)
 }
 
 function Get-ReadyGemmaStatusText {
     param($Result)
 
     if (-not $script:gemmaHelperAvailable) {
-        return 'Gemma 4 helper is unavailable in this environment.'
+        return 'The Ollama helper is unavailable in this environment.'
     }
 
     if ($null -eq $Result) {
-        return 'Load a video to use Gemma 4.'
+        return 'Load a video to use Ollama transcript post-processing.'
     }
 
     if ([string]::IsNullOrWhiteSpace([string]$Result.Transcript)) {
-        return 'No transcript available for Gemma 4 yet.'
+        return 'No transcript available for Ollama post-processing yet.'
     }
 
-    return 'Ready to run Gemma 4 on the current transcript.'
+    $selectedModel = Get-SelectedOllamaModel
+    if ([string]::IsNullOrWhiteSpace($selectedModel)) {
+        return 'No Ollama model is selected.'
+    }
+
+    return ("Ready to run Ollama model '{0}' on the current transcript." -f $selectedModel)
 }
 
 function Reset-ResultGemmaState {
@@ -630,10 +679,21 @@ function Reset-ResultGemmaState {
 
     $nextStatus = if ([string]::IsNullOrWhiteSpace($Status)) { Get-ReadyGemmaStatusText -Result $Result } else { $Status }
     $Result.GemmaDisplayText = ''
+    $Result.GemmaActivityText = ''
     $Result.GemmaStatus = $nextStatus
+    $Result.GemmaModel = ''
     $Result.GemmaPresetId = ''
     $Result.GemmaSourceTextHash = ''
     $Result.GemmaResultPath = ''
+    if ($Result.PSObject.Properties.Name -contains 'BundleLlmResultPath') {
+        $Result.BundleLlmResultPath = ''
+    }
+    if ($Result.PSObject.Properties.Name -contains 'BundlePromptPath') {
+        $Result.BundlePromptPath = ''
+    }
+    if ($Result.PSObject.Properties.Name -contains 'BundleDisplayPath') {
+        $Result.BundleDisplayPath = ''
+    }
 }
 
 function Get-RepoFfmpegBinDirectory {
@@ -887,6 +947,276 @@ function Start-GuiPythonApp {
     }
 }
 
+function Get-LocalTranscriptStudioPythonPath {
+    foreach ($candidate in @(
+        (Join-Path $script:transcriptStudioProjectRoot '.venv\Scripts\python.exe'),
+        (Join-Path $script:transcriptStudioProjectRoot '.venv\Scripts\pythonw.exe')
+    )) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return $candidate
+        }
+    }
+
+    return $null
+}
+
+function Get-TranscriptStudioInvocation {
+    param(
+        [string[]]$Arguments
+    )
+
+    $workingDirectory = $script:transcriptStudioProjectRoot
+    $runnerDescription = ''
+    $executable = ''
+    $commandArgs = @()
+
+    $localPython = Get-LocalTranscriptStudioPythonPath
+    if ($localPython) {
+        $executable = $localPython
+        $commandArgs = @('-m', $script:transcriptStudioModule) + @($Arguments)
+        $runnerDescription = "{0} {1}" -f $localPython, ($commandArgs -join ' ')
+    }
+    else {
+        $uvPath = Get-UvExecutablePath
+        if (-not $uvPath) {
+            throw "Transcript Studio dependencies are not installed. Run 'uv sync' in '$workingDirectory' first."
+        }
+
+        $executable = $uvPath
+        $commandArgs = @('run', '--project', $workingDirectory, $script:transcriptStudioApp) + @($Arguments)
+        $runnerDescription = "{0} {1}" -f $uvPath, ($commandArgs -join ' ')
+    }
+
+    return [pscustomobject]@{
+        WorkingDirectory  = $workingDirectory
+        Executable        = $executable
+        CommandArgs       = $commandArgs
+        RunnerDescription = $runnerDescription
+        ArgumentString    = ConvertTo-ProcessArgumentString -Arguments $commandArgs
+    }
+}
+
+function New-TranscriptStudioLaunchLogs {
+    param([string]$SessionPath)
+
+    Ensure-DirectoryExists -Path $script:logDir
+    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $sessionLabel = [System.IO.Path]::GetFileNameWithoutExtension([string]$SessionPath)
+    if ([string]::IsNullOrWhiteSpace($sessionLabel)) {
+        $sessionLabel = 'session'
+    }
+
+    $safeLabel = [System.Text.RegularExpressions.Regex]::Replace($sessionLabel, '[^A-Za-z0-9._-]+', '-').Trim('-')
+    if ([string]::IsNullOrWhiteSpace($safeLabel)) {
+        $safeLabel = 'session'
+    }
+
+    return [pscustomobject]@{
+        StdOutPath = Join-Path $script:logDir ("transcript-studio-{0}-{1}.stdout.log" -f $safeLabel, $timestamp)
+        StdErrPath = Join-Path $script:logDir ("transcript-studio-{0}-{1}.stderr.log" -f $safeLabel, $timestamp)
+    }
+}
+
+function Get-TranscriptStudioLaunchDiagnosticText {
+    param(
+        [string]$SessionPath,
+        [string]$StdOutPath,
+        [string]$StdErrPath,
+        [object]$Process
+    )
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('Transcript Studio exited before it opened a visible window.')
+    if (-not [string]::IsNullOrWhiteSpace($SessionPath)) {
+        $lines.Add("Session: $SessionPath")
+    }
+
+    if ($null -ne $Process) {
+        try {
+            $lines.Add(("Exit code: {0}" -f $Process.ExitCode))
+        }
+        catch {
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($StdOutPath)) {
+        $lines.Add("stdout log: $StdOutPath")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($StdErrPath)) {
+        $lines.Add("stderr log: $StdErrPath")
+    }
+
+    $combinedOutput = Get-CombinedToolOutput -StdOutPath $StdOutPath -StdErrPath $StdErrPath
+    $excerpt = Get-ActivityExcerptText -Text $combinedOutput -MaxLines 24 -MaxCharacters 2200
+    if (-not [string]::IsNullOrWhiteSpace($excerpt)) {
+        $lines.Add('')
+        $lines.Add('Recent output:')
+        $lines.Add($excerpt)
+    }
+
+    return (($lines.ToArray()) -join [Environment]::NewLine).Trim()
+}
+
+function Start-TranscriptStudioApp {
+    param(
+        [string]$SessionPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SessionPath)) {
+        throw 'Transcript Studio launch requires a session file path.'
+    }
+
+    $invocation = Get-TranscriptStudioInvocation -Arguments @('--session', $SessionPath)
+    $launchLogs = New-TranscriptStudioLaunchLogs -SessionPath $SessionPath
+    Write-Log -Level 'INFO' -Message ("Starting Transcript Studio: {0} | stdout: {1} | stderr: {2}" -f $invocation.RunnerDescription, $launchLogs.StdOutPath, $launchLogs.StdErrPath)
+
+    $process = Start-Process `
+        -FilePath $invocation.Executable `
+        -ArgumentList $invocation.ArgumentString `
+        -WorkingDirectory $invocation.WorkingDirectory `
+        -RedirectStandardOutput $launchLogs.StdOutPath `
+        -RedirectStandardError $launchLogs.StdErrPath `
+        -PassThru
+
+    if ($null -eq $process) {
+        throw 'Failed to start Transcript Studio.'
+    }
+
+    Start-Sleep -Milliseconds 1200
+    try {
+        $process.Refresh()
+    }
+    catch {
+    }
+
+    if ($process.HasExited) {
+        $diagnostic = Get-TranscriptStudioLaunchDiagnosticText -SessionPath $SessionPath -StdOutPath $launchLogs.StdOutPath -StdErrPath $launchLogs.StdErrPath -Process $process
+        Write-Log -Level 'ERROR' -Message $diagnostic
+        throw $diagnostic
+    }
+
+    return [pscustomobject]@{
+        Process           = $process
+        RunnerDescription = $invocation.RunnerDescription
+        SessionPath       = $SessionPath
+        StdOutPath        = $launchLogs.StdOutPath
+        StdErrPath        = $launchLogs.StdErrPath
+    }
+}
+
+function Ensure-TranscriptStudioStorage {
+    Ensure-DirectoryExists -Path $script:guiTranscriptStudioDir
+}
+
+function ConvertFrom-JsonSafe {
+    param([string]$JsonText)
+
+    if ([string]::IsNullOrWhiteSpace($JsonText)) {
+        return $null
+    }
+
+    try {
+        return ($JsonText | ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Write-TranscriptStudioSessionFile {
+    param($Result)
+
+    if ($null -eq $Result) {
+        throw 'Transcript Studio requires a loaded result.'
+    }
+
+    $videoId = ([string]$Result.VideoId).Trim()
+    $bundleRoot = [string]$Result.BundleRoot
+    if (-not [string]::IsNullOrWhiteSpace($bundleRoot) -and (Test-Path -LiteralPath $bundleRoot -PathType Container)) {
+        $sessionPath = Join-Path $bundleRoot 'exports\transcript-studio.session.json'
+    }
+    else {
+        Ensure-TranscriptStudioStorage
+        $sessionFileName = if ([string]::IsNullOrWhiteSpace($videoId)) { 'transcript-session.json' } else { "$videoId.session.json" }
+        $sessionPath = Join-Path $script:guiTranscriptStudioDir $sessionFileName
+    }
+
+    $sessionDirectory = Split-Path -Parent $sessionPath
+    Ensure-DirectoryExists -Path $sessionDirectory
+    $timingsPayload = ConvertFrom-JsonSafe -JsonText ([string]$Result.TranscriptTimingJson)
+    $rawJsonPayload = ConvertFrom-JsonSafe -JsonText ([string]$Result.RawJson)
+    $sessionAudioPath = if (-not [string]::IsNullOrWhiteSpace([string]$Result.BundleAudioPath)) { [string]$Result.BundleAudioPath } elseif (-not [string]::IsNullOrWhiteSpace([string]$Result.AudioPath)) { [string]$Result.AudioPath } else { '' }
+    $sessionTranscriptPath = if (-not [string]::IsNullOrWhiteSpace([string]$Result.BundleTranscriptPath)) { [string]$Result.BundleTranscriptPath } elseif (-not [string]::IsNullOrWhiteSpace([string]$Result.TranscriptPath)) { [string]$Result.TranscriptPath } else { '' }
+    $sessionTimingPath = if (-not [string]::IsNullOrWhiteSpace([string]$Result.BundleTimingPath)) { [string]$Result.BundleTimingPath } elseif (-not [string]::IsNullOrWhiteSpace([string]$Result.TranscriptTimingPath)) { [string]$Result.TranscriptTimingPath } else { '' }
+    $sessionLlmResultPath = if (-not [string]::IsNullOrWhiteSpace([string]$Result.BundleLlmResultPath)) { [string]$Result.BundleLlmResultPath } else { [string]$Result.GemmaResultPath }
+    $sessionPromptPath = [string]$Result.BundlePromptPath
+    $sessionDisplayPath = [string]$Result.BundleDisplayPath
+    $sessionMetadataPath = [string]$Result.BundleMetadataPath
+
+    $audioPathValue = if ([string]::IsNullOrWhiteSpace($sessionAudioPath)) { '' } else { (Get-RelativePathFromBase -BasePath $sessionDirectory -TargetPath $sessionAudioPath) }
+    $transcriptPathValue = if ([string]::IsNullOrWhiteSpace($sessionTranscriptPath)) { '' } else { (Get-RelativePathFromBase -BasePath $sessionDirectory -TargetPath $sessionTranscriptPath) }
+    $timingPathValue = if ([string]::IsNullOrWhiteSpace($sessionTimingPath)) { '' } else { (Get-RelativePathFromBase -BasePath $sessionDirectory -TargetPath $sessionTimingPath) }
+    $metadataPathValue = if ([string]::IsNullOrWhiteSpace($sessionMetadataPath)) { '' } else { (Get-RelativePathFromBase -BasePath $sessionDirectory -TargetPath $sessionMetadataPath) }
+    $bundleManifestValue = if ([string]::IsNullOrWhiteSpace([string]$Result.BundleManifestPath)) { '' } else { (Get-RelativePathFromBase -BasePath $sessionDirectory -TargetPath ([string]$Result.BundleManifestPath)) }
+
+    $metadata = [ordered]@{
+        transcriptStatus = [string]$Result.TranscriptStatus
+        transcriptSource = [string]$Result.TranscriptSource
+        transcriptMode   = [string]$Result.TranscriptMode
+        metaRows         = @($Result.MetaRows)
+        chapters         = @($Result.Chapters)
+        rawJson          = if ($null -ne $rawJsonPayload) { $rawJsonPayload } else { [string]$Result.RawJson }
+        bundleManifest   = $bundleManifestValue
+        metadataJsonPath = $metadataPathValue
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Result.GemmaDisplayText) -or -not [string]::IsNullOrWhiteSpace([string]$Result.GemmaStatus)) {
+        $metadata.ollama = [ordered]@{
+            model          = [string]$Result.GemmaModel
+            presetId       = [string]$Result.GemmaPresetId
+            displayText    = [string]$Result.GemmaDisplayText
+            status         = [string]$Result.GemmaStatus
+            resultPath     = if ([string]::IsNullOrWhiteSpace($sessionLlmResultPath)) { '' } else { (Get-RelativePathFromBase -BasePath $sessionDirectory -TargetPath $sessionLlmResultPath) }
+            promptPath     = if ([string]::IsNullOrWhiteSpace($sessionPromptPath)) { '' } else { (Get-RelativePathFromBase -BasePath $sessionDirectory -TargetPath $sessionPromptPath) }
+            displayPath    = if ([string]::IsNullOrWhiteSpace($sessionDisplayPath)) { '' } else { (Get-RelativePathFromBase -BasePath $sessionDirectory -TargetPath $sessionDisplayPath) }
+            sourceTextHash = [string]$Result.GemmaSourceTextHash
+        }
+    }
+
+    $payload = [ordered]@{
+        sessionVersion = 1
+        title          = [string]$Result.Title
+        description    = [string]$Result.Description
+        subtitle       = [string]$Result.TranscriptStatus
+        sourceKind     = 'youtube'
+        sourceId       = $videoId
+        sourceUrl      = [string]$Result.VideoUrl
+        audioPath      = $audioPathValue
+        transcriptPath = $transcriptPathValue
+        timingsPath    = $timingPathValue
+        transcriptText = [string]$Result.Transcript
+        timings        = if ($null -ne $timingsPayload) { $timingsPayload } else { $null }
+        metadata       = $metadata
+    }
+
+    $sessionJson = $payload | ConvertTo-Json -Depth 30
+    Write-TextFileUtf8 -Path $sessionPath -Text $sessionJson
+    if (-not [string]::IsNullOrWhiteSpace($videoId)) {
+        $manifest = Get-VideoBundleManifest -VideoId $videoId -Title ([string]$Result.Title) -SourceUrl ([string]$Result.VideoUrl)
+        $manifest.counters.transcriptStudioLaunches = [int]$manifest.counters.transcriptStudioLaunches + 1
+        Set-ManifestLatestPath -Manifest $manifest -PropertyName 'transcriptStudioSession' -VideoId $videoId -AbsolutePath $sessionPath
+        Upsert-BundleArtifact -Manifest $manifest -Artifact (New-BundleArtifactRecord -VideoId $videoId -Path $sessionPath -Kind 'transcript-studio-session' -Role 'export')
+        Save-VideoBundleManifest -VideoId $videoId -Manifest $manifest
+        Add-BundleEvent -VideoId $videoId -Type 'transcript_studio_session_exported' -Outputs ([ordered]@{
+            session = (Get-RelativePathFromBase -BasePath (Get-VideoBundleDirectory -VideoId $videoId) -TargetPath $sessionPath)
+        }) -Details ([ordered]@{
+            transcriptMode = [string]$Result.TranscriptMode
+        })
+    }
+    $Result.BundleSessionPath = [string]$sessionPath
+    return $sessionPath
+}
+
 function Invoke-LocalLlmToolCapture {
     param(
         [string[]]$Arguments
@@ -976,6 +1306,41 @@ function Get-GemmaPresetDefinitions {
     return @($presets)
 }
 
+function Get-OllamaModelDefinitions {
+    $response = Invoke-LocalLlmToolCapture -Arguments @('list-models', '--timeout-seconds', '15')
+    if ([int]$response.ExitCode -ne 0) {
+        throw "Failed to load installed Ollama models.`n$($response.Output)"
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$response.Output)) {
+        throw 'Ollama model listing returned empty output.'
+    }
+
+    $models = $response.Output | ConvertFrom-Json -ErrorAction Stop
+    return @($models)
+}
+
+function Get-SelectedOllamaModel {
+    if ($null -eq $OllamaModelComboBox) {
+        return ''
+    }
+
+    $selected = $OllamaModelComboBox.SelectedItem
+    if ($null -eq $selected) {
+        return ''
+    }
+
+    $model = ''
+    if ($selected.PSObject.Properties.Name -contains 'model') {
+        $model = [string]$selected.model
+    }
+    elseif ($selected.PSObject.Properties.Name -contains 'name') {
+        $model = [string]$selected.name
+    }
+
+    return $model.Trim()
+}
+
 function Get-SelectedGemmaPresetId {
     if ($null -eq $GemmaPresetComboBox) {
         return ''
@@ -987,6 +1352,45 @@ function Get-SelectedGemmaPresetId {
     }
 
     return [string]$selected.id
+}
+
+function Get-SelectedGemmaPresetDefinition {
+    if ($null -eq $GemmaPresetComboBox) {
+        return $null
+    }
+
+    return $GemmaPresetComboBox.SelectedItem
+}
+
+function Update-GemmaPresetTemplateUi {
+    $preset = Get-SelectedGemmaPresetDefinition
+    if ($null -eq $preset) {
+        $GemmaPresetDetailsTextBox.Text = 'Select a prompt preset to inspect the exact template instructions that will be sent with the transcript.'
+        return
+    }
+
+    $label = ([string]$preset.label).Trim()
+    $description = ([string]$preset.description).Trim()
+    $instructions = ([string]$preset.instructions).Trim()
+    $parts = New-Object System.Collections.Generic.List[string]
+
+    if (-not [string]::IsNullOrWhiteSpace($label)) {
+        $parts.Add("Preset: $label")
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($description)) {
+        $parts.Add('')
+        $parts.Add("Description`n$description")
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($instructions)) {
+        $parts.Add('')
+        $parts.Add("Instructions`n$instructions")
+    }
+
+    $GemmaPresetDetailsTextBox.Text = ($parts -join [Environment]::NewLine).Trim()
+    $GemmaPresetDetailsTextBox.ScrollToHome()
+    $GemmaPresetDetailsExpander.IsExpanded = $true
 }
 
 function Read-GemmaResultFile {
@@ -1007,15 +1411,16 @@ function Read-GemmaResultFile {
 function Get-CachedGemmaResult {
     param(
         [string]$VideoId,
+        [string]$Model,
         [string]$PresetId,
         [string]$TranscriptHash
     )
 
-    if ([string]::IsNullOrWhiteSpace($VideoId) -or [string]::IsNullOrWhiteSpace($PresetId) -or [string]::IsNullOrWhiteSpace($TranscriptHash)) {
+    if ([string]::IsNullOrWhiteSpace($VideoId) -or [string]::IsNullOrWhiteSpace($Model) -or [string]::IsNullOrWhiteSpace($PresetId) -or [string]::IsNullOrWhiteSpace($TranscriptHash)) {
         return $null
     }
 
-    $resultPath = Get-GuiGemmaResultPath -VideoId $VideoId -Model $script:ollamaModel -PresetId $PresetId -TranscriptHash $TranscriptHash
+    $resultPath = Get-GuiGemmaResultPath -VideoId $VideoId -Model $Model -PresetId $PresetId -TranscriptHash $TranscriptHash
     if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
         return $null
     }
@@ -1028,7 +1433,7 @@ function Get-CachedGemmaResult {
         return $null
     }
 
-    if ([string]$payload.sourceTextHash -ne $TranscriptHash -or [string]$payload.presetId -ne $PresetId -or [string]$payload.model -ne $script:ollamaModel) {
+    if ([string]$payload.sourceTextHash -ne $TranscriptHash -or [string]$payload.presetId -ne $PresetId -or [string]$payload.model -ne $Model) {
         Write-Log -Level 'WARN' -Message ("Ignoring cached Gemma result because its metadata did not match the current request. Path: {0}" -f $resultPath)
         return $null
     }
@@ -1130,6 +1535,9 @@ function Prepare-WhisperTranscription {
     }
 
     $audioFile = Get-GuiWhisperExistingAudioFile -VideoId $VideoId
+    $audioWasExtracted = $false
+    $audioExtractionOutput = ''
+    $audioExtractionUsedCookieFallback = $false
     if ($null -eq $audioFile) {
         $ffmpegBin = Get-RepoFfmpegBinDirectory
         $outputTemplate = Join-Path $script:guiAudioDir '%(id)s.%(ext)s'
@@ -1151,6 +1559,12 @@ function Prepare-WhisperTranscription {
         }
 
         $audioFile = Get-GuiWhisperExistingAudioFile -VideoId $VideoId
+        $audioWasExtracted = $true
+        $audioExtractionOutput = [string]$audioResult.Output
+        $audioExtractionUsedCookieFallback = [bool]$audioRequest.UsedCookieFallback
+        if ($audioFile) {
+            Write-BundleAudioExtractionArtifacts -VideoId $VideoId -AudioPath $audioFile.FullName -ExtractionLog $audioExtractionOutput -UsedCookieFallback $audioExtractionUsedCookieFallback | Out-Null
+        }
     }
 
     if ($null -eq $audioFile) {
@@ -1170,12 +1584,15 @@ function Prepare-WhisperTranscription {
     )
 
     return [pscustomobject]@{
-        Mode           = 'launch'
-        VideoId        = $VideoId
-        AudioPath      = $audioFile.FullName
-        TranscriptPath = $transcriptPath
-        TimingPath     = $timingPath
-        Arguments      = $whisperArgs
+        Mode                       = 'launch'
+        VideoId                    = $VideoId
+        AudioPath                  = $audioFile.FullName
+        TranscriptPath             = $transcriptPath
+        TimingPath                 = $timingPath
+        Arguments                  = $whisperArgs
+        AudioWasExtracted          = $audioWasExtracted
+        AudioExtractionOutput      = $audioExtractionOutput
+        AudioExtractionUsedCookieFallback = $audioExtractionUsedCookieFallback
     }
 }
 
@@ -1373,16 +1790,21 @@ function Get-TranscriptData {
             }
 
             return [pscustomobject]@{
-                Text   = ''
-                Status = $status
-                Source = ''
-                Output = $fetchResult.Output
+                Text                  = ''
+                Status                = $status
+                Source                = ''
+                Output                = $fetchResult.Output
+                CaptionContent        = ''
+                CaptionExtension      = ''
+                UsedCookieFallback    = [bool]$fetchRequest.UsedCookieFallback
+                SubtitleCandidateCount = [int]$subtitleCount
             }
         }
 
         $bestFile = Get-BestSubtitleFile -Files $subtitleFiles
         Write-Log -Level 'INFO' -Message "Selected subtitle file: $($bestFile.FullName)"
         $text = Convert-SubtitleFileToText -Path $bestFile.FullName
+        $captionContent = Read-TextFile -Path $bestFile.FullName
         Write-Log -Level 'INFO' -Message ("Transcript character count: {0}" -f $text.Length)
 
         $statusMessage = if ([string]::IsNullOrWhiteSpace($text)) {
@@ -1392,10 +1814,14 @@ function Get-TranscriptData {
         }
 
         return [pscustomobject]@{
-            Text   = $text
-            Status = $statusMessage
-            Source = $bestFile.Name
-            Output = $fetchResult.Output
+            Text                  = $text
+            Status                = $statusMessage
+            Source                = $bestFile.Name
+            Output                = $fetchResult.Output
+            CaptionContent        = [string]$captionContent
+            CaptionExtension      = [string]$bestFile.Extension
+            UsedCookieFallback    = [bool]$fetchRequest.UsedCookieFallback
+            SubtitleCandidateCount = [int]$subtitleCount
         }
     }
     finally {
@@ -1492,6 +1918,25 @@ function Get-VideoResearchData {
         $metaResult.Output
     }
 
+    $resolvedVideoUrl = if ([string]::IsNullOrWhiteSpace([string]$info.webpage_url)) { [string]$Url } else { [string]$info.webpage_url }
+    $bundleArtifacts = Write-BundleFetchArtifacts `
+        -VideoId ([string]$info.id) `
+        -Title ([string]$info.title) `
+        -SourceUrl $resolvedVideoUrl `
+        -MetadataJson ([string]$rawJsonPretty) `
+        -MetadataFetchLog ([string]$metaResult.Output) `
+        -SubtitleFetchLog ([string]$transcript.Output) `
+        -TranscriptText ([string]$transcript.Text) `
+        -TranscriptStatus ([string]$transcript.Status) `
+        -TranscriptSource ([string]$transcript.Source) `
+        -CaptionContent ([string]$transcript.CaptionContent) `
+        -CaptionExtension ([string]$transcript.CaptionExtension) `
+        -UseCookies $UseCookies `
+        -ProfilePath $ProfilePath `
+        -MetadataUsedCookieFallback ([bool]$metaRequest.UsedCookieFallback) `
+        -SubtitleUsedCookieFallback ([bool]$transcript.UsedCookieFallback) `
+        -SubtitleCandidateCount ([int]$transcript.SubtitleCandidateCount)
+
     return [pscustomobject]@{
         Title            = [string]$info.title
         Description      = [string]$info.description
@@ -1502,11 +1947,27 @@ function Get-VideoResearchData {
         TranscriptSource = [string]$transcript.Source
         TranscriptMode   = if ([string]::IsNullOrWhiteSpace([string]$transcript.Text)) { 'none' } else { 'youtube' }
         VideoId          = [string]$info.id
-        VideoUrl         = if ([string]::IsNullOrWhiteSpace([string]$info.webpage_url)) { [string]$Url } else { [string]$info.webpage_url }
+        VideoUrl         = $resolvedVideoUrl
+        AudioPath        = ''
+        TranscriptPath   = ''
         TranscriptTimingJson = ''
         TranscriptTimingPath = ''
+        BundleRoot       = [string]$bundleArtifacts.BundleRoot
+        BundleManifestPath = [string]$bundleArtifacts.ManifestPath
+        BundleEventsPath = [string]$bundleArtifacts.EventsPath
+        BundleMetadataPath = [string]$bundleArtifacts.MetadataPath
+        BundleCaptionPath = [string]$bundleArtifacts.CaptionPath
+        BundleTranscriptPath = [string]$bundleArtifacts.TranscriptPath
+        BundleAudioPath = ''
+        BundleTimingPath = ''
+        BundleLlmResultPath = ''
+        BundlePromptPath = ''
+        BundleDisplayPath = ''
+        BundleSessionPath = ''
         GemmaDisplayText = ''
+        GemmaActivityText = ''
         GemmaStatus      = ''
+        GemmaModel       = ''
         GemmaPresetId    = ''
         GemmaSourceTextHash = ''
         GemmaResultPath  = ''
@@ -1535,6 +1996,21 @@ function Assert-ValidYoutubeUrl {
     }
 }
 
+function Resolve-YoutubeInputToUrl {
+    param([string]$InputText)
+
+    $candidate = ([string]$InputText).Trim()
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        throw 'Please enter a YouTube video ID or URL.'
+    }
+
+    if ($candidate -match '^[A-Za-z0-9_-]{11}$') {
+        return ("https://www.youtube.com/watch?v={0}" -f $candidate)
+    }
+
+    return $candidate
+}
+
 if (-not (Test-Path -LiteralPath $YtDlpPath -PathType Leaf)) {
     Write-Log -Level 'ERROR' -Message "Configured yt-dlp path does not exist: $YtDlpPath"
     throw "Could not find yt-dlp executable at '$YtDlpPath'."
@@ -1547,148 +2023,208 @@ Write-Log -Level 'INFO' -Message ("Default Firefox profile detection result: {0}
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="YT Research GUI" Height="840" Width="1240" MinHeight="700" MinWidth="980"
+        Title="YT Research GUI" Height="920" Width="1480" MinHeight="760" MinWidth="1160"
         WindowStartupLocation="CenterScreen">
     <Grid Margin="12">
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
-        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,8">
-            <TextBlock Text="YouTube URL:" VerticalAlignment="Center" Margin="0,0,8,0" FontWeight="SemiBold"/>
-            <TextBox x:Name="UrlBox" Width="840" Height="30" Margin="0,0,8,0" VerticalContentAlignment="Center"/>
-            <Button x:Name="FetchButton" Width="120" Height="30" Content="Fetch"/>
-        </StackPanel>
+        <Grid Grid.Row="0" Margin="0,0,0,8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="420"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="16"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Text="Video ID or URL:" VerticalAlignment="Center" Margin="0,0,8,0" FontWeight="SemiBold"/>
+            <TextBox Grid.Column="1" x:Name="UrlBox" Height="30" Margin="0,0,8,0" VerticalContentAlignment="Center"/>
+            <Button Grid.Column="2" x:Name="FetchButton" Width="120" Height="30" Content="Fetch"/>
+            <WrapPanel Grid.Column="4" HorizontalAlignment="Right">
+                <Button x:Name="CopyTitleButton" Content="Copy Title" Width="110" Height="28" Margin="0,0,8,0"/>
+                <Button x:Name="CopyDescriptionButton" Content="Copy Description" Width="130" Height="28" Margin="0,0,8,0"/>
+                <Button x:Name="CopyTranscriptButton" Content="Copy Transcript" Width="130" Height="28" Margin="0,0,8,0"/>
+                <Button x:Name="CopyJsonButton" Content="Copy Raw JSON" Width="120" Height="28"/>
+            </WrapPanel>
+        </Grid>
 
-        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,8">
-            <CheckBox x:Name="UseCookiesCheck" VerticalAlignment="Center" Content="Use Firefox cookies" Margin="0,0,16,0"/>
-            <TextBlock Text="Profile folder:" VerticalAlignment="Center" Margin="0,0,8,0"/>
-            <TextBox x:Name="ProfilePathBox" Width="760" Height="28" Margin="0,0,8,0" VerticalContentAlignment="Center"/>
-            <Button x:Name="BrowseProfileButton" Width="110" Height="28" Content="Browse..."/>
-        </StackPanel>
+        <Expander Grid.Row="1" x:Name="BrowserOptionsExpander" Header="Browser Options" IsExpanded="False" Margin="0,0,0,8">
+            <Grid Margin="8,6,8,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <CheckBox Grid.Column="0" x:Name="UseCookiesCheck" VerticalAlignment="Center" Content="Use Firefox cookies" Margin="0,0,16,0"/>
+                <TextBlock Grid.Column="1" Text="Profile folder:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <TextBox Grid.Column="2" x:Name="ProfilePathBox" Height="28" Margin="0,0,8,0" VerticalContentAlignment="Center"/>
+                <Button Grid.Column="3" x:Name="BrowseProfileButton" Width="110" Height="28" Content="Browse..."/>
+            </Grid>
+        </Expander>
 
-        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,8">
-            <Button x:Name="CopyTitleButton" Content="Copy Title" Width="120" Height="28" Margin="0,0,8,0"/>
-            <Button x:Name="CopyDescriptionButton" Content="Copy Description" Width="140" Height="28" Margin="0,0,8,0"/>
-            <Button x:Name="CopyTranscriptButton" Content="Copy Transcript" Width="140" Height="28" Margin="0,0,8,0"/>
-            <Button x:Name="CopyJsonButton" Content="Copy Raw JSON" Width="130" Height="28" Margin="0,0,8,0"/>
-        </StackPanel>
+        <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="360"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
 
-        <TabControl Grid.Row="3" x:Name="ResultsTabs">
-            <TabItem Header="Overview">
-                <Grid Margin="8">
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="2*"/>
-                        <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="*"/>
-                    </Grid.RowDefinitions>
-
-                    <TextBlock Grid.Row="0" Text="Core Metadata" FontWeight="SemiBold" Margin="0,0,0,6"/>
-                    <DataGrid Grid.Row="1" x:Name="MetaGrid" IsReadOnly="True" AutoGenerateColumns="False" CanUserAddRows="False" CanUserDeleteRows="False" HeadersVisibility="Column" Margin="0,0,0,10">
-                        <DataGrid.Columns>
-                            <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="220"/>
-                            <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="*"/>
-                        </DataGrid.Columns>
-                    </DataGrid>
-
-                    <TextBlock Grid.Row="2" Text="Chapters" FontWeight="SemiBold" Margin="0,0,0,6"/>
-                    <DataGrid Grid.Row="3" x:Name="ChaptersGrid" IsReadOnly="True" AutoGenerateColumns="False" CanUserAddRows="False" CanUserDeleteRows="False" HeadersVisibility="Column">
-                        <DataGrid.Columns>
-                            <DataGridTextColumn Header="Start" Binding="{Binding Start}" Width="110"/>
-                            <DataGridTextColumn Header="End" Binding="{Binding End}" Width="110"/>
-                            <DataGridTextColumn Header="Title" Binding="{Binding Title}" Width="*"/>
-                        </DataGrid.Columns>
-                    </DataGrid>
-                </Grid>
-            </TabItem>
-
-            <TabItem Header="Description">
-                <Grid Margin="8">
-                    <TextBox x:Name="DescriptionTextBox" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True"
-                             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
-                             FontFamily="Consolas" FontSize="13"/>
-                </Grid>
-            </TabItem>
-
-            <TabItem Header="Transcript">
-                <Grid Margin="8">
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="180"/>
-                        <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="*"/>
-                    </Grid.RowDefinitions>
-                    <Grid Grid.Row="0" Margin="0,0,0,6">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" x:Name="TranscriptStatusText" Margin="0,0,8,0" TextWrapping="Wrap"/>
-                        <Button Grid.Column="1" x:Name="WhisperTranscriptButton" Width="190" Height="28" Content="Transcribe with Whisper" IsEnabled="False"/>
+            <TabControl Grid.Column="0" Margin="0,0,8,0">
+                <TabItem Header="Overview">
+                    <Grid Margin="8">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+                        <TextBlock Grid.Row="0" x:Name="TitleTextBlock" Text="No video loaded." FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,4"/>
+                        <TextBlock Grid.Row="1" x:Name="VideoIdTextBlock" Text="Fetch a video to load metadata." Foreground="DimGray" Margin="0,0,0,10" TextWrapping="Wrap"/>
+                        <DataGrid Grid.Row="2" x:Name="MetaGrid" IsReadOnly="True" AutoGenerateColumns="False" CanUserAddRows="False" CanUserDeleteRows="False" HeadersVisibility="Column">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="140"/>
+                                <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="*"/>
+                            </DataGrid.Columns>
+                        </DataGrid>
                     </Grid>
-                    <TextBlock Grid.Row="1" x:Name="WhisperProgressText" Margin="0,0,0,6" Foreground="DimGray" Text="Whisper idle." TextWrapping="Wrap"/>
-                    <GroupBox Grid.Row="2" Header="Whisper Activity" Margin="0,0,0,8">
-                        <TextBox x:Name="WhisperActivityTextBox" IsReadOnly="True" TextWrapping="NoWrap" AcceptsReturn="True"
+                </TabItem>
+
+                <TabItem Header="Description">
+                    <Grid Margin="8">
+                        <TextBox x:Name="DescriptionTextBox" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True"
+                                 VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                                 FontFamily="Consolas" FontSize="13"/>
+                    </Grid>
+                </TabItem>
+
+                <TabItem Header="Chapters">
+                    <Grid Margin="8">
+                        <DataGrid x:Name="ChaptersGrid" IsReadOnly="True" AutoGenerateColumns="False" CanUserAddRows="False" CanUserDeleteRows="False" HeadersVisibility="Column">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="Start" Binding="{Binding Start}" Width="90"/>
+                                <DataGridTextColumn Header="End" Binding="{Binding End}" Width="90"/>
+                                <DataGridTextColumn Header="Title" Binding="{Binding Title}" Width="*"/>
+                            </DataGrid.Columns>
+                        </DataGrid>
+                    </Grid>
+                </TabItem>
+
+                <TabItem Header="Raw JSON">
+                    <Grid Margin="8">
+                        <TextBox x:Name="RawJsonTextBox" IsReadOnly="True" TextWrapping="NoWrap" AcceptsReturn="True"
                                  VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
                                  FontFamily="Consolas" FontSize="12"/>
-                    </GroupBox>
-                    <Grid Grid.Row="3" Margin="0,0,0,6">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="280"/>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="Gemma Prompt:" VerticalAlignment="Center" FontWeight="SemiBold" Margin="0,0,8,0"/>
-                        <ComboBox Grid.Column="1" x:Name="GemmaPresetComboBox" Height="28" Margin="0,0,8,0" IsEnabled="False"/>
-                        <Button Grid.Column="2" x:Name="RunGemmaButton" Width="150" Height="28" Margin="0,0,8,0" Content="Run Gemma 4" IsEnabled="False"/>
                     </Grid>
-                    <TextBlock Grid.Row="4" x:Name="GemmaStatusText" Margin="0,0,0,6" Foreground="DimGray" Text="Gemma 4 idle." TextWrapping="Wrap"/>
-                    <Grid Grid.Row="5">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="12"/>
-                            <ColumnDefinition Width="*"/>
-                        </Grid.ColumnDefinitions>
-                        <GroupBox Grid.Column="0" Header="Transcript Text">
-                            <TextBox x:Name="TranscriptTextBox" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True"
+                </TabItem>
+            </TabControl>
+
+            <GridSplitter Grid.Column="1" Width="8" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" Background="#D9D9D9" ShowsPreview="True"/>
+
+            <TabControl Grid.Column="2">
+                <TabItem Header="Transcript Workspace">
+                    <Grid Margin="8">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <Grid Grid.Row="0" Margin="0,0,0,6">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" x:Name="TranscriptStatusText" Margin="0,0,8,0" TextWrapping="Wrap"/>
+                            <Button Grid.Column="1" x:Name="WhisperTranscriptButton" Width="190" Height="28" Margin="0,0,8,0" Content="Transcribe with Whisper" IsEnabled="False"/>
+                            <Button Grid.Column="2" x:Name="OpenTranscriptStudioButton" Width="136" Height="28" Content="Open In Studio" IsEnabled="False"/>
+                        </Grid>
+
+                        <TextBlock Grid.Row="1" x:Name="WhisperProgressText" Margin="0,0,0,8" Foreground="DimGray" Text="Whisper idle." TextWrapping="Wrap"/>
+
+                        <Grid Grid.Row="2" Margin="0,0,0,8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="220"/>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="240"/>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="Ollama Model:" VerticalAlignment="Center" FontWeight="SemiBold" Margin="0,0,8,0"/>
+                            <ComboBox Grid.Column="1" x:Name="OllamaModelComboBox" Height="28" Margin="0,0,12,0" IsEnabled="False"/>
+                            <TextBlock Grid.Column="2" Text="Prompt Preset:" VerticalAlignment="Center" FontWeight="SemiBold" Margin="0,0,8,0"/>
+                            <ComboBox Grid.Column="3" x:Name="GemmaPresetComboBox" Height="28" Margin="0,0,12,0" IsEnabled="False"/>
+                            <Button Grid.Column="4" x:Name="RunGemmaButton" Width="150" Height="28" Margin="0,0,8,0" Content="Run with Ollama" IsEnabled="False"/>
+                            <Button Grid.Column="5" x:Name="StopGemmaButton" Width="90" Height="28" Content="Stop" IsEnabled="False"/>
+                        </Grid>
+
+                        <Expander Grid.Row="3" x:Name="GemmaPresetDetailsExpander" Header="Selected Prompt Template" IsExpanded="True" Margin="0,0,0,8">
+                            <TextBox x:Name="GemmaPresetDetailsTextBox" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True"
                                      VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
-                                     FontFamily="Consolas" FontSize="13"/>
-                        </GroupBox>
-                        <GroupBox Grid.Column="2" Header="Gemma Result">
-                            <TextBox x:Name="GemmaResultTextBox" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True"
-                                     VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
-                                     FontFamily="Consolas" FontSize="13"/>
-                        </GroupBox>
+                                     FontFamily="Consolas" FontSize="12" MinHeight="96" MaxHeight="180" Padding="8"/>
+                        </Expander>
+
+                        <Grid Grid.Row="4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="8"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <GroupBox Grid.Column="0" Header="Transcript Text">
+                                <TextBox x:Name="TranscriptTextBox" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True"
+                                         VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                                         FontFamily="Consolas" FontSize="13"/>
+                            </GroupBox>
+                            <GridSplitter Grid.Column="1" Width="8" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" Background="#D9D9D9" ShowsPreview="True"/>
+                            <GroupBox Grid.Column="2" Header="Ollama Result">
+                                <DockPanel>
+                                    <TextBlock DockPanel.Dock="Top" x:Name="GemmaStatusText" Margin="8,8,8,0" Foreground="DimGray" Text="Ollama idle." TextWrapping="Wrap"/>
+                                    <TextBox x:Name="GemmaResultTextBox" Margin="8" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True"
+                                             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                                             FontFamily="Consolas" FontSize="13"/>
+                                </DockPanel>
+                            </GroupBox>
+                        </Grid>
+
+                        <Grid Grid.Row="5" Margin="0,8,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="12"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Expander Grid.Column="0" x:Name="WhisperActivityExpander" Header="Whisper Activity" IsExpanded="False">
+                                <TextBox x:Name="WhisperActivityTextBox" IsReadOnly="True" TextWrapping="NoWrap" AcceptsReturn="True"
+                                         VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                                         FontFamily="Consolas" FontSize="12" MinHeight="120" MaxHeight="220"/>
+                            </Expander>
+                            <Expander Grid.Column="2" x:Name="GemmaActivityExpander" Header="Ollama Activity" IsExpanded="False">
+                                <TextBox x:Name="GemmaActivityTextBox" IsReadOnly="True" TextWrapping="NoWrap" AcceptsReturn="True"
+                                         VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                                         FontFamily="Consolas" FontSize="12" MinHeight="120" MaxHeight="220"/>
+                            </Expander>
+                        </Grid>
                     </Grid>
-                </Grid>
-            </TabItem>
+                </TabItem>
 
-            <TabItem Header="Transcript Timing">
-                <Grid Margin="8">
-                    <TextBox x:Name="TranscriptTimingTextBox" IsReadOnly="True" TextWrapping="NoWrap" AcceptsReturn="True"
-                             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
-                             FontFamily="Consolas" FontSize="12"/>
-                </Grid>
-            </TabItem>
+                <TabItem Header="Transcript Timing">
+                    <Grid Margin="8">
+                        <TextBox x:Name="TranscriptTimingTextBox" IsReadOnly="True" TextWrapping="NoWrap" AcceptsReturn="True"
+                                 VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                                 FontFamily="Consolas" FontSize="12"/>
+                    </Grid>
+                </TabItem>
+            </TabControl>
+        </Grid>
 
-            <TabItem Header="Raw JSON">
-                <Grid Margin="8">
-                    <TextBox x:Name="RawJsonTextBox" IsReadOnly="True" TextWrapping="NoWrap" AcceptsReturn="True"
-                             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
-                             FontFamily="Consolas" FontSize="12"/>
-                </Grid>
-            </TabItem>
-        </TabControl>
-
-        <TextBlock Grid.Row="4" x:Name="StatusTextBlock" Margin="0,8,0,0" Text="Ready. Paste a YouTube URL and click Fetch."/>
+        <TextBlock Grid.Row="3" x:Name="StatusTextBlock" Margin="0,8,0,0" Text="Ready. Enter a YouTube video ID or paste a full URL, then click Fetch."/>
     </Grid>
 </Window>
 "@
@@ -1705,18 +2241,29 @@ $CopyTitleButton = $window.FindName('CopyTitleButton')
 $CopyDescriptionButton = $window.FindName('CopyDescriptionButton')
 $CopyTranscriptButton = $window.FindName('CopyTranscriptButton')
 $CopyJsonButton = $window.FindName('CopyJsonButton')
+$BrowserOptionsExpander = $window.FindName('BrowserOptionsExpander')
+$TitleTextBlock = $window.FindName('TitleTextBlock')
+$VideoIdTextBlock = $window.FindName('VideoIdTextBlock')
 $MetaGrid = $window.FindName('MetaGrid')
 $ChaptersGrid = $window.FindName('ChaptersGrid')
 $DescriptionTextBox = $window.FindName('DescriptionTextBox')
 $TranscriptStatusText = $window.FindName('TranscriptStatusText')
 $WhisperTranscriptButton = $window.FindName('WhisperTranscriptButton')
+$OpenTranscriptStudioButton = $window.FindName('OpenTranscriptStudioButton')
 $WhisperProgressText = $window.FindName('WhisperProgressText')
+$WhisperActivityExpander = $window.FindName('WhisperActivityExpander')
 $WhisperActivityTextBox = $window.FindName('WhisperActivityTextBox')
+$OllamaModelComboBox = $window.FindName('OllamaModelComboBox')
 $GemmaPresetComboBox = $window.FindName('GemmaPresetComboBox')
 $RunGemmaButton = $window.FindName('RunGemmaButton')
+$StopGemmaButton = $window.FindName('StopGemmaButton')
+$GemmaPresetDetailsExpander = $window.FindName('GemmaPresetDetailsExpander')
+$GemmaPresetDetailsTextBox = $window.FindName('GemmaPresetDetailsTextBox')
 $GemmaStatusText = $window.FindName('GemmaStatusText')
 $TranscriptTextBox = $window.FindName('TranscriptTextBox')
 $TranscriptTimingTextBox = $window.FindName('TranscriptTimingTextBox')
+$GemmaActivityExpander = $window.FindName('GemmaActivityExpander')
+$GemmaActivityTextBox = $window.FindName('GemmaActivityTextBox')
 $GemmaResultTextBox = $window.FindName('GemmaResultTextBox')
 $RawJsonTextBox = $window.FindName('RawJsonTextBox')
 $StatusTextBlock = $window.FindName('StatusTextBlock')
@@ -1762,9 +2309,12 @@ function Set-WhisperActivityUi {
 
     $WhisperProgressText.Text = $ProgressText
     $nextActivityText = [string]$ActivityText
+    if ($script:isTranscribingWhisper -and -not [string]::IsNullOrWhiteSpace($nextActivityText)) {
+        $WhisperActivityExpander.IsExpanded = $true
+    }
     if ($WhisperActivityTextBox.Text -ne $nextActivityText) {
         $WhisperActivityTextBox.Text = $nextActivityText
-        $WhisperActivityTextBox.ScrollToEnd()
+        Scroll-TextBoxToBottom -TextBox $WhisperActivityTextBox
     }
 }
 
@@ -1786,20 +2336,52 @@ function Get-GemmaStatusDisplayText {
 function Set-GemmaUi {
     param(
         [string]$StatusText,
-        [string]$ResultText
+        [string]$ResultText,
+        [string]$ActivityText = '',
+        [switch]$ScrollResultToEnd
     )
 
     $nextStatus = if ([string]::IsNullOrWhiteSpace($StatusText)) { Get-ReadyGemmaStatusText -Result $script:lastResult } else { $StatusText }
     $GemmaStatusText.Text = $nextStatus
 
+    $nextActivityText = [string]$ActivityText
+    if ($script:isProcessingGemma -and -not [string]::IsNullOrWhiteSpace($nextActivityText)) {
+        $GemmaActivityExpander.IsExpanded = $true
+    }
+    if ($GemmaActivityTextBox.Text -ne $nextActivityText) {
+        $GemmaActivityTextBox.Text = $nextActivityText
+        Scroll-TextBoxToBottom -TextBox $GemmaActivityTextBox
+    }
+
     $nextResult = [string]$ResultText
     if ($GemmaResultTextBox.Text -ne $nextResult) {
         $GemmaResultTextBox.Text = $nextResult
-        $GemmaResultTextBox.ScrollToHome()
+        if ($ScrollResultToEnd) {
+            Scroll-TextBoxToBottom -TextBox $GemmaResultTextBox
+        }
+        else {
+            $GemmaResultTextBox.ScrollToHome()
+        }
     }
 }
 
-function Normalize-WhisperLogText {
+function Scroll-TextBoxToBottom {
+    param($TextBox)
+
+    if ($null -eq $TextBox) {
+        return
+    }
+
+    try {
+        $TextBox.UpdateLayout()
+        $TextBox.CaretIndex = $TextBox.Text.Length
+        $TextBox.ScrollToEnd()
+    }
+    catch {
+    }
+}
+
+function Normalize-ToolLogText {
     param([string]$Text)
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
@@ -1809,18 +2391,43 @@ function Normalize-WhisperLogText {
     return (([string]$Text -replace "`r`n", "`n") -replace "`r", "`n").Trim()
 }
 
-function Get-WhisperLogTailText {
+function Get-ToolLogLines {
+    param(
+        [string]$Path,
+        [switch]$IncludeInternalMarkers
+    )
+
+    $normalized = Normalize-ToolLogText -Text (Read-TextFile -Path $Path)
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return @()
+    }
+
+    $lines = @($normalized -split "`n")
+    if (-not $IncludeInternalMarkers) {
+        $lines = @(
+            foreach ($line in $lines) {
+                $text = [string]$line
+                if (-not $text.StartsWith($script:ollamaChunkPrefix, [System.StringComparison]::Ordinal)) {
+                    $text
+                }
+            }
+        )
+    }
+
+    return @($lines)
+}
+
+function Get-ToolLogTailText {
     param(
         [string]$Path,
         [int]$MaxLines = 40
     )
 
-    $normalized = Normalize-WhisperLogText -Text (Read-TextFile -Path $Path)
-    if ([string]::IsNullOrWhiteSpace($normalized)) {
+    $lines = @(Get-ToolLogLines -Path $Path)
+    if ($lines.Count -eq 0) {
         return ''
     }
 
-    $lines = @($normalized -split "`n")
     if ($lines.Count -gt $MaxLines) {
         $lines = $lines[($lines.Count - $MaxLines)..($lines.Count - 1)]
     }
@@ -1828,15 +2435,18 @@ function Get-WhisperLogTailText {
     return (($lines | ForEach-Object { $_.TrimEnd() }) -join [Environment]::NewLine).Trim()
 }
 
-function Get-WhisperCombinedOutput {
+function Get-CombinedToolOutput {
     param(
         [string]$StdOutPath,
-        [string]$StdErrPath
+        [string]$StdErrPath,
+        [switch]$IncludeInternalMarkers
     )
 
     $parts = New-Object System.Collections.Generic.List[string]
-    $stdoutText = Normalize-WhisperLogText -Text (Read-TextFile -Path $StdOutPath)
-    $stderrText = Normalize-WhisperLogText -Text (Read-TextFile -Path $StdErrPath)
+    $stdoutLines = @(Get-ToolLogLines -Path $StdOutPath -IncludeInternalMarkers:$IncludeInternalMarkers)
+    $stderrLines = @(Get-ToolLogLines -Path $StdErrPath -IncludeInternalMarkers:$IncludeInternalMarkers)
+    $stdoutText = (($stdoutLines | ForEach-Object { $_.TrimEnd() }) -join [Environment]::NewLine).Trim()
+    $stderrText = (($stderrLines | ForEach-Object { $_.TrimEnd() }) -join [Environment]::NewLine).Trim()
 
     if (-not [string]::IsNullOrWhiteSpace($stdoutText)) {
         $parts.Add($stdoutText)
@@ -1849,18 +2459,21 @@ function Get-WhisperCombinedOutput {
     return ($parts -join [Environment]::NewLine).Trim()
 }
 
-function Get-WhisperActivityDisplayText {
+function Get-ToolActivityDisplayText {
     param(
         [string]$StdOutPath,
-        [string]$StdErrPath
+        [string]$StdErrPath,
+        [int]$MaxLines = 25,
+        [string]$StdOutLabel = 'stdout',
+        [string]$StdErrLabel = 'stderr'
     )
 
-    $stdoutTail = Get-WhisperLogTailText -Path $StdOutPath -MaxLines 25
-    $stderrTail = Get-WhisperLogTailText -Path $StdErrPath -MaxLines 25
+    $stdoutTail = Get-ToolLogTailText -Path $StdOutPath -MaxLines $MaxLines
+    $stderrTail = Get-ToolLogTailText -Path $StdErrPath -MaxLines $MaxLines
     $sections = New-Object System.Collections.Generic.List[string]
 
     if (-not [string]::IsNullOrWhiteSpace($stdoutTail)) {
-        $sections.Add('[stdout]')
+        $sections.Add(('[{0}]' -f $StdOutLabel))
         $sections.Add($stdoutTail)
     }
 
@@ -1869,11 +2482,146 @@ function Get-WhisperActivityDisplayText {
             $sections.Add('')
         }
 
-        $sections.Add('[stderr]')
+        $sections.Add(('[{0}]' -f $StdErrLabel))
         $sections.Add($stderrTail)
     }
 
     return ($sections -join [Environment]::NewLine).Trim()
+}
+
+function Get-LastToolLogLine {
+    param([string]$Path)
+
+    $lines = @(Get-ToolLogLines -Path $Path)
+    if ($lines.Count -eq 0) {
+        return ''
+    }
+
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        $line = ([string]$lines[$i]).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($line)) {
+            return $line
+        }
+    }
+
+    return ''
+}
+
+function Remove-ToolLogTimestampPrefix {
+    param([string]$Line)
+
+    if ([string]::IsNullOrWhiteSpace($Line)) {
+        return ''
+    }
+
+    return (([string]$Line -replace '^\[\d{2}:\d{2}:\d{2}\]\s*', '').Trim())
+}
+
+function Get-ActivityExcerptText {
+    param(
+        [string]$Text,
+        [int]$MaxLines = 18,
+        [int]$MaxCharacters = 1800
+    )
+
+    $normalized = Normalize-ToolLogText -Text $Text
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return ''
+    }
+
+    $lines = @($normalized -split "`n")
+    if ($lines.Count -gt $MaxLines) {
+        $lines = $lines[($lines.Count - $MaxLines)..($lines.Count - 1)]
+    }
+
+    $excerpt = (($lines | ForEach-Object { $_.TrimEnd() }) -join [Environment]::NewLine).Trim()
+    if ($excerpt.Length -gt $MaxCharacters) {
+        $excerpt = $excerpt.Substring($excerpt.Length - $MaxCharacters).Trim()
+    }
+
+    return $excerpt
+}
+
+function Get-WhisperCombinedOutput {
+    param(
+        [string]$StdOutPath,
+        [string]$StdErrPath
+    )
+
+    return (Get-CombinedToolOutput -StdOutPath $StdOutPath -StdErrPath $StdErrPath)
+}
+
+function Get-WhisperActivityDisplayText {
+    param(
+        [string]$StdOutPath,
+        [string]$StdErrPath
+    )
+
+    return (Get-ToolActivityDisplayText -StdOutPath $StdOutPath -StdErrPath $StdErrPath -MaxLines 25)
+}
+
+function Get-GemmaActivityDisplayText {
+    param(
+        [string]$StdOutPath,
+        [string]$StdErrPath
+    )
+
+    return (Get-ToolActivityDisplayText -StdOutPath $StdOutPath -StdErrPath $StdErrPath -MaxLines 40)
+}
+
+function Get-GemmaStreamingPreviewText {
+    param([string]$StdOutPath)
+
+    $lines = @(Get-ToolLogLines -Path $StdOutPath -IncludeInternalMarkers)
+    if ($lines.Count -eq 0) {
+        return ''
+    }
+
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($line in $lines) {
+        $text = [string]$line
+        if (-not $text.StartsWith($script:ollamaChunkPrefix, [System.StringComparison]::Ordinal)) {
+            continue
+        }
+
+        $encoded = $text.Substring($script:ollamaChunkPrefix.Length)
+        if ([string]::IsNullOrWhiteSpace($encoded)) {
+            continue
+        }
+
+        try {
+            $bytes = [System.Convert]::FromBase64String($encoded)
+            [void]$builder.Append([System.Text.Encoding]::UTF8.GetString($bytes))
+        }
+        catch {
+        }
+    }
+
+    return $builder.ToString()
+}
+
+function Get-GemmaProgressDisplayText {
+    param(
+        [string]$StdOutPath,
+        [string]$StdErrPath,
+        [string]$Model
+    )
+
+    $stderrLatest = Remove-ToolLogTimestampPrefix -Line (Get-LastToolLogLine -Path $StdErrPath)
+    if (-not [string]::IsNullOrWhiteSpace($stderrLatest)) {
+        return $stderrLatest
+    }
+
+    $stdoutLatest = Remove-ToolLogTimestampPrefix -Line (Get-LastToolLogLine -Path $StdOutPath)
+    if (-not [string]::IsNullOrWhiteSpace($stdoutLatest)) {
+        return $stdoutLatest
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Model)) {
+        return 'Running Ollama in the background...'
+    }
+
+    return ("Running Ollama model '{0}' in the background..." -f $Model)
 }
 
 function Get-WhisperProgressDisplayText {
@@ -1882,8 +2630,8 @@ function Get-WhisperProgressDisplayText {
         [string]$StdErrPath
     )
 
-    $stdoutText = Normalize-WhisperLogText -Text (Read-TextFile -Path $StdOutPath)
-    $stderrText = Normalize-WhisperLogText -Text (Read-TextFile -Path $StdErrPath)
+    $stdoutText = Normalize-ToolLogText -Text (Read-TextFile -Path $StdOutPath)
+    $stderrText = Normalize-ToolLogText -Text (Read-TextFile -Path $StdErrPath)
 
     $percentMatches = [System.Text.RegularExpressions.Regex]::Matches($stderrText, '(?<percent>\d{1,3})%')
     if ($percentMatches.Count -gt 0) {
@@ -1930,8 +2678,19 @@ function Apply-WhisperResultToUi {
     $script:lastResult.TranscriptStatus = [string]$WhisperResult.Status
     $script:lastResult.TranscriptSource = [string]$WhisperResult.Source
     $script:lastResult.TranscriptMode = if ([string]::IsNullOrWhiteSpace([string]$WhisperResult.Text)) { 'none' } else { 'whisper' }
+    $script:lastResult.AudioPath = [string]$WhisperResult.AudioPath
+    $script:lastResult.TranscriptPath = [string]$WhisperResult.TranscriptPath
     $script:lastResult.TranscriptTimingJson = [string]$WhisperResult.TimingJson
     $script:lastResult.TranscriptTimingPath = [string]$WhisperResult.TimingPath
+    if ($WhisperResult.PSObject.Properties.Name -contains 'BundleAudioPath') {
+        $script:lastResult.BundleAudioPath = [string]$WhisperResult.BundleAudioPath
+    }
+    if ($WhisperResult.PSObject.Properties.Name -contains 'BundleTranscriptPath') {
+        $script:lastResult.BundleTranscriptPath = [string]$WhisperResult.BundleTranscriptPath
+    }
+    if ($WhisperResult.PSObject.Properties.Name -contains 'BundleTimingPath') {
+        $script:lastResult.BundleTimingPath = [string]$WhisperResult.BundleTimingPath
+    }
     Reset-ResultGemmaState -Result $script:lastResult
     Apply-ResultToUi -Result $script:lastResult
 }
@@ -1957,6 +2716,7 @@ function Clear-ActiveWhisperRunState {
     $script:activeWhisperAudioPath = ''
     $script:activeWhisperVideoId = ''
     $script:activeWhisperOutputSummary = ''
+    $script:activeWhisperBundleRunId = ''
 }
 
 function Complete-ActiveWhisperRun {
@@ -1980,6 +2740,7 @@ function Complete-ActiveWhisperRun {
     $outputText = Get-WhisperCombinedOutput -StdOutPath $script:activeWhisperStdOutPath -StdErrPath $script:activeWhisperStdErrPath
     $exitCodeDisplay = if ([string]::IsNullOrWhiteSpace([string]$exitCode)) { 'unavailable' } else { [string]$exitCode }
     $didSucceed = Test-WhisperRunSucceeded -ExitCode $exitCode -TranscriptPath $script:activeWhisperTranscriptPath -OutputText $outputText
+    $whisperRunId = if ([string]::IsNullOrWhiteSpace([string]$script:activeWhisperBundleRunId)) { (Get-BundleRunId -Prefix 'whisper') } else { [string]$script:activeWhisperBundleRunId }
     $script:activeWhisperOutputSummary = $outputText
     $script:isTranscribingWhisper = $false
     $FetchButton.IsEnabled = $true
@@ -1987,6 +2748,21 @@ function Complete-ActiveWhisperRun {
 
     if ($didSucceed) {
         $whisperResult = Get-WhisperTranscriptResult -TranscriptPath $script:activeWhisperTranscriptPath -TimingPath $script:activeWhisperTimingPath -AudioPath $script:activeWhisperAudioPath -Output $outputText
+        $bundleWhisper = Write-BundleWhisperRunArtifacts `
+            -VideoId $videoId `
+            -RunId $whisperRunId `
+            -Mode 'background' `
+            -Status 'completed' `
+            -AudioPath $script:activeWhisperAudioPath `
+            -TranscriptPath $script:activeWhisperTranscriptPath `
+            -TimingPath $script:activeWhisperTimingPath `
+            -StdOutPath $script:activeWhisperStdOutPath `
+            -StdErrPath $script:activeWhisperStdErrPath `
+            -ExitCode $exitCode `
+            -OutputText $outputText
+        $whisperResult | Add-Member -NotePropertyName BundleAudioPath -NotePropertyValue ([string]$bundleWhisper.AudioPath) -Force
+        $whisperResult | Add-Member -NotePropertyName BundleTranscriptPath -NotePropertyValue ([string]$bundleWhisper.TranscriptPath) -Force
+        $whisperResult | Add-Member -NotePropertyName BundleTimingPath -NotePropertyValue ([string]$bundleWhisper.TimingPath) -Force
         Apply-WhisperResultToUi -WhisperResult $whisperResult
         Set-WhisperActivityUi -ProgressText $(if ([string]::IsNullOrWhiteSpace([string]$whisperResult.Text)) { 'Whisper finished, but no transcript text was produced.' } else { 'Whisper finished. Local transcript is now loaded.' }) -ActivityText $activityText
 
@@ -2001,6 +2777,18 @@ function Complete-ActiveWhisperRun {
         Write-Log -Level 'INFO' -Message ("Whisper transcription completed. VideoId: {0} | ExitCode: {1} | TranscriptLength: {2}" -f $videoId, $exitCodeDisplay, $transcriptLength)
     }
     else {
+        Write-BundleWhisperRunArtifacts `
+            -VideoId $videoId `
+            -RunId $whisperRunId `
+            -Mode 'background' `
+            -Status 'failed' `
+            -AudioPath $script:activeWhisperAudioPath `
+            -TranscriptPath $script:activeWhisperTranscriptPath `
+            -TimingPath $script:activeWhisperTimingPath `
+            -StdOutPath $script:activeWhisperStdOutPath `
+            -StdErrPath $script:activeWhisperStdErrPath `
+            -ExitCode $exitCode `
+            -OutputText $outputText | Out-Null
         $errorMessage = "Whisper transcription failed (exit code $exitCodeDisplay). See the Whisper Activity panel for details."
         Set-WhisperActivityUi -ProgressText 'Whisper failed.' -ActivityText $activityText
         if ($script:lastResult) {
@@ -2062,15 +2850,19 @@ function Clear-ActiveGemmaRunState {
     $script:activeGemmaInputPath = ''
     $script:activeGemmaVideoId = ''
     $script:activeGemmaPresetId = ''
+    $script:activeGemmaModel = ''
     $script:activeGemmaTranscriptHash = ''
+    $script:activeGemmaBundleRunId = ''
 }
 
 function Apply-GemmaResultToUi {
     param(
         $GemmaPayload,
+        [string]$Model,
         [string]$PresetId,
         [string]$Status,
-        [string]$ResultPath
+        [string]$ResultPath,
+        [string]$ActivityText = ''
     )
 
     if ($null -eq $script:lastResult -or $null -eq $GemmaPayload) {
@@ -2078,7 +2870,9 @@ function Apply-GemmaResultToUi {
     }
 
     $script:lastResult.GemmaDisplayText = [string]$GemmaPayload.displayText
+    $script:lastResult.GemmaActivityText = [string]$ActivityText
     $script:lastResult.GemmaStatus = [string]$Status
+    $script:lastResult.GemmaModel = [string]$Model
     $script:lastResult.GemmaPresetId = [string]$PresetId
     $script:lastResult.GemmaSourceTextHash = [string]$GemmaPayload.sourceTextHash
     $script:lastResult.GemmaResultPath = [string]$ResultPath
@@ -2119,10 +2913,14 @@ function Complete-ActiveGemmaRun {
 
     $videoId = [string]$script:activeGemmaVideoId
     $presetId = [string]$script:activeGemmaPresetId
+    $model = [string]$script:activeGemmaModel
     $exitCode = $script:activeGemmaProcess.ExitCode
-    $outputText = Get-WhisperCombinedOutput -StdOutPath $script:activeGemmaStdOutPath -StdErrPath $script:activeGemmaStdErrPath
+    $activityText = Get-GemmaActivityDisplayText -StdOutPath $script:activeGemmaStdOutPath -StdErrPath $script:activeGemmaStdErrPath
+    $outputText = Get-CombinedToolOutput -StdOutPath $script:activeGemmaStdOutPath -StdErrPath $script:activeGemmaStdErrPath
+    $activityExcerpt = Get-ActivityExcerptText -Text $outputText
     $didSucceed = Test-GemmaRunSucceeded -ExitCode $exitCode -ResultPath $script:activeGemmaResultPath -OutputText $outputText
     $exitCodeDisplay = if ([string]::IsNullOrWhiteSpace([string]$exitCode)) { 'unavailable' } else { [string]$exitCode }
+    $llmRunId = if ([string]::IsNullOrWhiteSpace([string]$script:activeGemmaBundleRunId)) { (Get-BundleRunId -Prefix 'llm') } else { [string]$script:activeGemmaBundleRunId }
     $script:isProcessingGemma = $false
     $FetchButton.IsEnabled = $true
     $window.Cursor = [System.Windows.Input.Cursors]::Arrow
@@ -2130,35 +2928,95 @@ function Complete-ActiveGemmaRun {
     if ($didSucceed) {
         try {
             $gemmaPayload = Read-GemmaResultFile -Path $script:activeGemmaResultPath
-            $gemmaStatus = "Loaded Gemma 4 result for preset '$presetId'."
-            Apply-GemmaResultToUi -GemmaPayload $gemmaPayload -PresetId $presetId -Status $gemmaStatus -ResultPath $script:activeGemmaResultPath
-            Set-Status -Message "Loaded Gemma 4 result for video ID: $videoId" -Color 'Green'
-            Write-Log -Level 'INFO' -Message ("Gemma 4 processing completed. VideoId: {0} | Preset: {1} | ExitCode: {2}" -f $videoId, $presetId, $exitCodeDisplay)
+            $bundleLlm = Write-BundleLlmRunArtifacts `
+                -VideoId $videoId `
+                -RunId $llmRunId `
+                -Mode 'background' `
+                -Status 'completed' `
+                -Model $model `
+                -PresetId $presetId `
+                -TranscriptHash $script:activeGemmaTranscriptHash `
+                -InputFilePath $script:activeGemmaInputPath `
+                -ResultFilePath $script:activeGemmaResultPath `
+                -StdOutPath $script:activeGemmaStdOutPath `
+                -StdErrPath $script:activeGemmaStdErrPath `
+                -ActivityText $activityText `
+                -ExitCode $exitCode
+            $gemmaStatus = "Loaded Ollama result from '$model' for preset '$presetId'."
+            Apply-GemmaResultToUi -GemmaPayload $gemmaPayload -Model $model -PresetId $presetId -Status $gemmaStatus -ResultPath $script:activeGemmaResultPath -ActivityText $activityText
+            if ($script:lastResult) {
+                $script:lastResult.BundleLlmResultPath = [string]$bundleLlm.ResultPath
+                $script:lastResult.BundlePromptPath = [string]$bundleLlm.PromptPath
+                $script:lastResult.BundleDisplayPath = [string]$bundleLlm.DisplayPath
+            }
+            Set-Status -Message "Loaded Ollama result for video ID: $videoId" -Color 'Green'
+            Write-Log -Level 'INFO' -Message ("Ollama processing completed. VideoId: {0} | Preset: {1} | Model: {2} | ExitCode: {3}" -f $videoId, $presetId, $model, $exitCodeDisplay)
         }
         catch {
-            $errorMessage = "Gemma 4 completed, but the result file could not be loaded. See the logs for details."
+            Write-BundleLlmRunArtifacts `
+                -VideoId $videoId `
+                -RunId $llmRunId `
+                -Mode 'background' `
+                -Status 'failed' `
+                -Model $model `
+                -PresetId $presetId `
+                -TranscriptHash $script:activeGemmaTranscriptHash `
+                -InputFilePath $script:activeGemmaInputPath `
+                -ResultFilePath $script:activeGemmaResultPath `
+                -StdOutPath $script:activeGemmaStdOutPath `
+                -StdErrPath $script:activeGemmaStdErrPath `
+                -ActivityText $activityText `
+                -ExitCode $exitCode | Out-Null
+            $errorMessage = "Ollama completed, but the result file could not be loaded. See the Ollama Activity panel for details."
             if ($script:lastResult) {
+                $script:lastResult.GemmaActivityText = [string]$activityText
                 $script:lastResult.GemmaStatus = $errorMessage
+                $script:lastResult.GemmaModel = $model
                 Apply-ResultToUi -Result $script:lastResult
             }
 
             $logHint = if ($script:logPath) { " See log: $script:logPath" } else { '' }
             Set-Status -Message ($errorMessage + $logHint) -Color 'Red'
-            Write-Log -Level 'ERROR' -Message ("Gemma 4 result loading failed. VideoId: {0} | Preset: {1}`n{2}" -f $videoId, $presetId, (Get-ErrorDetails -ErrorObject $_))
-            [System.Windows.MessageBox]::Show(($errorMessage + $logHint), 'Gemma 4 Failed', 'OK', 'Error') | Out-Null
+            Write-Log -Level 'ERROR' -Message ("Ollama result loading failed. VideoId: {0} | Preset: {1} | Model: {2}`n{3}`n{4}" -f $videoId, $presetId, $model, $activityText, (Get-ErrorDetails -ErrorObject $_))
+            $dialogMessage = $errorMessage
+            if (-not [string]::IsNullOrWhiteSpace($activityExcerpt)) {
+                $dialogMessage = $dialogMessage + "`n`nRecent helper output:`n" + $activityExcerpt
+            }
+            [System.Windows.MessageBox]::Show(($dialogMessage + $logHint), 'Ollama Failed', 'OK', 'Error') | Out-Null
         }
     }
     else {
-        $errorMessage = "Gemma 4 processing failed (exit code $exitCodeDisplay)."
+        Write-BundleLlmRunArtifacts `
+            -VideoId $videoId `
+            -RunId $llmRunId `
+            -Mode 'background' `
+            -Status 'failed' `
+            -Model $model `
+            -PresetId $presetId `
+            -TranscriptHash $script:activeGemmaTranscriptHash `
+            -InputFilePath $script:activeGemmaInputPath `
+            -ResultFilePath $script:activeGemmaResultPath `
+            -StdOutPath $script:activeGemmaStdOutPath `
+            -StdErrPath $script:activeGemmaStdErrPath `
+            -ActivityText $activityText `
+            -ExitCode $exitCode | Out-Null
+        $errorMessage = "Ollama processing failed (exit code $exitCodeDisplay)."
+        $statusDetail = Remove-ToolLogTimestampPrefix -Line (Get-GemmaProgressDisplayText -StdOutPath $script:activeGemmaStdOutPath -StdErrPath $script:activeGemmaStdErrPath -Model $model)
         if ($script:lastResult) {
-            $script:lastResult.GemmaStatus = 'Gemma 4 failed.'
+            $script:lastResult.GemmaActivityText = [string]$activityText
+            $script:lastResult.GemmaStatus = if ([string]::IsNullOrWhiteSpace($statusDetail)) { 'Ollama failed.' } else { $statusDetail }
+            $script:lastResult.GemmaModel = $model
             Apply-ResultToUi -Result $script:lastResult
         }
 
         $logHint = if ($script:logPath) { " See log: $script:logPath" } else { '' }
         Set-Status -Message ($errorMessage + $logHint) -Color 'Red'
-        Write-Log -Level 'ERROR' -Message ("Gemma 4 processing failed. VideoId: {0} | Preset: {1} | ExitCode: {2}`n{3}" -f $videoId, $presetId, $exitCodeDisplay, $outputText)
-        [System.Windows.MessageBox]::Show(($errorMessage + $logHint), 'Gemma 4 Failed', 'OK', 'Error') | Out-Null
+        Write-Log -Level 'ERROR' -Message ("Ollama processing failed. VideoId: {0} | Preset: {1} | Model: {2} | ExitCode: {3}`n{4}" -f $videoId, $presetId, $model, $exitCodeDisplay, $outputText)
+        $dialogMessage = $errorMessage
+        if (-not [string]::IsNullOrWhiteSpace($activityExcerpt)) {
+            $dialogMessage = $dialogMessage + "`n`nRecent helper output:`n" + $activityExcerpt
+        }
+        [System.Windows.MessageBox]::Show(($dialogMessage + $logHint), 'Ollama Failed', 'OK', 'Error') | Out-Null
     }
 
     Clear-ActiveGemmaRunState
@@ -2171,6 +3029,22 @@ function Update-ActiveGemmaRunUi {
         return
     }
 
+    $activityText = Get-GemmaActivityDisplayText -StdOutPath $script:activeGemmaStdOutPath -StdErrPath $script:activeGemmaStdErrPath
+    $progressText = Get-GemmaProgressDisplayText -StdOutPath $script:activeGemmaStdOutPath -StdErrPath $script:activeGemmaStdErrPath -Model $script:activeGemmaModel
+    $streamingPreview = Get-GemmaStreamingPreviewText -StdOutPath $script:activeGemmaStdOutPath
+    if ($script:lastResult) {
+        $script:lastResult.GemmaActivityText = [string]$activityText
+        $script:lastResult.GemmaStatus = [string]$progressText
+        $script:lastResult.GemmaModel = [string]$script:activeGemmaModel
+        if (-not [string]::IsNullOrWhiteSpace($streamingPreview)) {
+            $script:lastResult.GemmaDisplayText = [string]$streamingPreview
+            Set-GemmaUi -StatusText $progressText -ResultText ([string]$streamingPreview) -ActivityText $activityText -ScrollResultToEnd
+        }
+        else {
+            Set-GemmaUi -StatusText $progressText -ResultText ([string]$script:lastResult.GemmaDisplayText) -ActivityText $activityText
+        }
+    }
+
     try {
         $script:activeGemmaProcess.Refresh()
     }
@@ -2180,6 +3054,77 @@ function Update-ActiveGemmaRunUi {
     if ($script:activeGemmaProcess.HasExited) {
         Complete-ActiveGemmaRun
     }
+}
+
+function Stop-ActiveGemmaRun {
+    param(
+        [string]$Reason = 'Ollama run stopped by user.'
+    )
+
+    if ($null -eq $script:activeGemmaProcess) {
+        return
+    }
+
+    $model = [string]$script:activeGemmaModel
+    $presetId = [string]$script:activeGemmaPresetId
+    $activityText = Get-GemmaActivityDisplayText -StdOutPath $script:activeGemmaStdOutPath -StdErrPath $script:activeGemmaStdErrPath
+    $streamingPreview = Get-GemmaStreamingPreviewText -StdOutPath $script:activeGemmaStdOutPath
+    $videoId = if ($script:lastResult) { [string]$script:lastResult.VideoId } else { [string]$script:activeGemmaVideoId }
+    $runId = if ([string]::IsNullOrWhiteSpace([string]$script:activeGemmaBundleRunId)) { (Get-BundleRunId -Prefix 'llm') } else { [string]$script:activeGemmaBundleRunId }
+    $transcriptHash = [string]$script:activeGemmaTranscriptHash
+    $inputPath = [string]$script:activeGemmaInputPath
+    $resultPath = [string]$script:activeGemmaResultPath
+    $stdoutPath = [string]$script:activeGemmaStdOutPath
+    $stderrPath = [string]$script:activeGemmaStdErrPath
+
+    try {
+        $script:activeGemmaProcess.Refresh()
+        if ($script:activeGemmaProcess.HasExited) {
+            Complete-ActiveGemmaRun
+            return
+        }
+
+        Write-Log -Level 'WARN' -Message ("Stopping active Ollama helper. Preset: {0} | Model: {1} | PID: {2}" -f $presetId, $model, $script:activeGemmaProcess.Id)
+        $script:activeGemmaProcess.Kill()
+    }
+    catch {
+        Write-Log -Level 'WARN' -Message ("Failed to stop the active Ollama helper:`n{0}" -f (Get-ErrorDetails -ErrorObject $_))
+    }
+    finally {
+        Clear-ActiveGemmaRunState
+    }
+
+    $script:isProcessingGemma = $false
+    Write-BundleLlmRunArtifacts `
+        -VideoId $videoId `
+        -RunId $runId `
+        -Mode 'background' `
+        -Status 'failed' `
+        -Model $model `
+        -PresetId $presetId `
+        -TranscriptHash $transcriptHash `
+        -InputFilePath $inputPath `
+        -TranscriptText $(if ($script:lastResult) { [string]$script:lastResult.Transcript } else { '' }) `
+        -ResultFilePath $resultPath `
+        -StdOutPath $stdoutPath `
+        -StdErrPath $stderrPath `
+        -ActivityText $Reason | Out-Null
+    $FetchButton.IsEnabled = $true
+    $window.Cursor = [System.Windows.Input.Cursors]::Arrow
+    if ($script:lastResult) {
+        $script:lastResult.GemmaActivityText = [string]$activityText
+        if (-not [string]::IsNullOrWhiteSpace($streamingPreview)) {
+            $script:lastResult.GemmaDisplayText = [string]$streamingPreview
+        }
+        $script:lastResult.GemmaStatus = [string]$Reason
+        $script:lastResult.GemmaModel = [string]$model
+        $script:lastResult.GemmaPresetId = [string]$presetId
+        Apply-ResultToUi -Result $script:lastResult
+    }
+
+    Set-Status -Message $Reason -Color 'DarkOrange'
+    Update-WhisperButtonState
+    Update-GemmaButtonState
 }
 
 function Test-WhisperRunSucceeded {
@@ -2237,48 +3182,28 @@ function Get-TranscriptStatusDisplayText {
 }
 
 function Update-WhisperButtonState {
-    $WhisperTranscriptButton.IsEnabled = $false
-    $WhisperTranscriptButton.Content = 'Transcribe with Whisper'
+    $isEnabled = $false
+    $content = 'Transcribe with Whisper'
 
     if ($script:isTranscribingWhisper) {
-        $WhisperTranscriptButton.Content = 'Whisper Running...'
-        return
+        $content = 'Whisper Running...'
+    }
+    elseif (-not $script:isFetching -and -not $script:isProcessingGemma -and $null -ne $script:lastResult -and -not [string]::IsNullOrWhiteSpace([string]$script:lastResult.VideoId)) {
+        if (Test-WhisperTranscriptCached -VideoId ([string]$script:lastResult.VideoId)) {
+            $content = 'Load Whisper Transcript'
+        }
+        $isEnabled = $true
     }
 
-    if ($script:isFetching -or $script:isProcessingGemma) {
-        return
-    }
-
-    if ($null -eq $script:lastResult) {
-        return
-    }
-
-    if ([string]::IsNullOrWhiteSpace([string]$script:lastResult.VideoId)) {
-        return
-    }
-
-    if (Test-WhisperTranscriptCached -VideoId ([string]$script:lastResult.VideoId)) {
-        $WhisperTranscriptButton.Content = 'Load Whisper Transcript'
-    }
-
-    $WhisperTranscriptButton.IsEnabled = $true
+    $WhisperTranscriptButton.Content = $content
+    $WhisperTranscriptButton.IsEnabled = $isEnabled
+    Update-TranscriptStudioButtonState
 }
 
-function Update-GemmaButtonState {
-    $RunGemmaButton.IsEnabled = $false
-    $RunGemmaButton.Content = 'Run Gemma 4'
-    $GemmaPresetComboBox.IsEnabled = $false
+function Update-TranscriptStudioButtonState {
+    $OpenTranscriptStudioButton.IsEnabled = $false
 
-    if (-not $script:gemmaHelperAvailable) {
-        return
-    }
-
-    if ($script:isProcessingGemma) {
-        $RunGemmaButton.Content = 'Gemma 4 Running...'
-        return
-    }
-
-    if ($script:isFetching -or $script:isTranscribingWhisper) {
+    if ($script:isFetching -or $script:isTranscribingWhisper -or $script:isProcessingGemma) {
         return
     }
 
@@ -2290,19 +3215,160 @@ function Update-GemmaButtonState {
         return
     }
 
-    $GemmaPresetComboBox.IsEnabled = ($script:gemmaPresets.Count -gt 0)
-    $selectedPresetId = Get-SelectedGemmaPresetId
-    if ([string]::IsNullOrWhiteSpace($selectedPresetId)) {
+    $audioPath = [string]$script:lastResult.AudioPath
+    if ([string]::IsNullOrWhiteSpace($audioPath)) {
         return
     }
 
-    $RunGemmaButton.IsEnabled = $true
+    if (-not (Test-Path -LiteralPath $audioPath -PathType Leaf)) {
+        return
+    }
+
+    $OpenTranscriptStudioButton.IsEnabled = $true
+}
+
+function Update-GemmaButtonState {
+    $runEnabled = $false
+    $runContent = 'Run with Ollama'
+    $stopEnabled = $false
+    $modelEnabled = $false
+    $presetEnabled = $false
+
+    if ($script:gemmaHelperAvailable) {
+        if ($script:isProcessingGemma) {
+            $runContent = 'Ollama Running...'
+            $stopEnabled = $true
+        }
+        elseif (-not $script:isFetching -and -not $script:isTranscribingWhisper) {
+            $modelEnabled = ($script:ollamaModels.Count -gt 0)
+
+            if ($null -ne $script:lastResult -and -not [string]::IsNullOrWhiteSpace([string]$script:lastResult.Transcript)) {
+                $selectedModel = Get-SelectedOllamaModel
+                if (-not [string]::IsNullOrWhiteSpace($selectedModel)) {
+                    $presetEnabled = ($script:gemmaPresets.Count -gt 0)
+                    $selectedPresetId = Get-SelectedGemmaPresetId
+                    if (-not [string]::IsNullOrWhiteSpace($selectedPresetId)) {
+                        $runEnabled = $true
+                    }
+                }
+            }
+        }
+    }
+
+    $RunGemmaButton.IsEnabled = $runEnabled
+    $RunGemmaButton.Content = $runContent
+    $StopGemmaButton.IsEnabled = $stopEnabled
+    $OllamaModelComboBox.IsEnabled = $modelEnabled
+    $GemmaPresetComboBox.IsEnabled = $presetEnabled
+    Update-TranscriptStudioButtonState
+}
+
+function Find-OllamaModelSelectionIndex {
+    param(
+        [object[]]$Models,
+        [string]$PreferredModel
+    )
+
+    if ($null -eq $Models -or $Models.Count -eq 0) {
+        return -1
+    }
+
+    $target = ([string]$PreferredModel).Trim()
+    if ([string]::IsNullOrWhiteSpace($target)) {
+        return 0
+    }
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $candidates.Add($target)
+    if ($target -notmatch ':') {
+        $candidates.Add(($target + ':latest'))
+    }
+    elseif ($target.EndsWith(':latest', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $candidates.Add(($target -replace ':latest$', ''))
+    }
+
+    foreach ($candidate in $candidates) {
+        for ($i = 0; $i -lt $Models.Count; $i++) {
+            if ([string]$Models[$i].model -eq $candidate) {
+                return $i
+            }
+        }
+    }
+
+    return -1
+}
+
+function Initialize-OllamaModels {
+    $script:ollamaModels = @()
+    $OllamaModelComboBox.ItemsSource = $null
+
+    $statusOverride = ''
+    try {
+        $loadedModels = New-Object System.Collections.Generic.List[object]
+        foreach ($rawModel in @(Get-OllamaModelDefinitions)) {
+            $entry = New-OllamaModelEntry `
+                -Model ([string]$rawModel.model) `
+                -Display ([string]$rawModel.display) `
+                -Family ([string]$rawModel.family) `
+                -ParameterSize ([string]$rawModel.parameterSize) `
+                -QuantizationLevel ([string]$rawModel.quantizationLevel) `
+                -Source 'ollama'
+            if ($null -ne $entry) {
+                $loadedModels.Add($entry)
+            }
+        }
+
+        if ($loadedModels.Count -eq 0) {
+            throw 'Ollama returned no installed models.'
+        }
+
+        $script:ollamaModels = @($loadedModels.ToArray())
+        Write-Log -Level 'INFO' -Message ("Loaded {0} installed Ollama models." -f $script:ollamaModels.Count)
+    }
+    catch {
+        $fallbackModel = New-OllamaModelEntry -Model $script:ollamaModel -Display ("{0} (configured default)" -f $script:ollamaModel) -Source 'config'
+        if ($null -ne $fallbackModel) {
+            $script:ollamaModels = @($fallbackModel)
+        }
+        $statusOverride = ("Could not query installed Ollama models. Using configured default '{0}'." -f $script:ollamaModel)
+        Write-Log -Level 'WARN' -Message ("Ollama model initialization failed:`n{0}" -f (Get-ErrorDetails -ErrorObject $_))
+    }
+
+    $OllamaModelComboBox.DisplayMemberPath = 'display'
+    $OllamaModelComboBox.SelectedValuePath = 'model'
+    $OllamaModelComboBox.ItemsSource = $script:ollamaModels
+    if ($script:ollamaModels.Count -gt 0) {
+        $selectedIndex = Find-OllamaModelSelectionIndex -Models $script:ollamaModels -PreferredModel $script:ollamaModel
+        if ($selectedIndex -lt 0) {
+            $selectedIndex = 0
+        }
+        $OllamaModelComboBox.SelectedIndex = $selectedIndex
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($statusOverride)) {
+        $existingResultText = ''
+        $existingActivityText = ''
+        if ($null -ne $script:lastResult) {
+            $script:lastResult.GemmaStatus = $statusOverride
+            $existingResultText = [string]$script:lastResult.GemmaDisplayText
+            $existingActivityText = [string]$script:lastResult.GemmaActivityText
+        }
+        Set-GemmaUi -StatusText $statusOverride -ResultText $existingResultText -ActivityText $existingActivityText
+    }
+    elseif ($script:gemmaHelperAvailable) {
+        $existingResultText = if ($script:lastResult) { [string]$script:lastResult.GemmaDisplayText } else { '' }
+        $existingActivityText = if ($script:lastResult) { [string]$script:lastResult.GemmaActivityText } else { '' }
+        Set-GemmaUi -StatusText (Get-ReadyGemmaStatusText -Result $script:lastResult) -ResultText $existingResultText -ActivityText $existingActivityText
+    }
+
+    Update-GemmaButtonState
 }
 
 function Initialize-GemmaPresets {
     $script:gemmaHelperAvailable = $false
     $script:gemmaPresets = @()
     $GemmaPresetComboBox.ItemsSource = $null
+    $GemmaPresetDetailsTextBox.Text = 'Select a prompt preset to inspect the exact template instructions that will be sent with the transcript.'
 
     try {
         $presets = @(Get-GemmaPresetDefinitions)
@@ -2313,10 +3379,11 @@ function Initialize-GemmaPresets {
         $GemmaPresetComboBox.ItemsSource = $presets
         if ($presets.Count -gt 0) {
             $GemmaPresetComboBox.SelectedIndex = 0
+            Update-GemmaPresetTemplateUi
             Write-Log -Level 'INFO' -Message ("Loaded {0} Gemma preset definitions." -f $presets.Count)
         }
         else {
-            $GemmaStatusText.Text = 'No Gemma 4 presets were found.'
+            $GemmaStatusText.Text = 'No Ollama prompt presets were found.'
             Write-Log -Level 'WARN' -Message 'Gemma preset listing returned no presets.'
         }
     }
@@ -2324,12 +3391,12 @@ function Initialize-GemmaPresets {
         $script:gemmaHelperAvailable = $false
         $script:gemmaPresets = @()
         $GemmaPresetComboBox.ItemsSource = $null
-        $GemmaStatusText.Text = 'Gemma 4 helper is unavailable. See the status bar or logs for details.'
+        $GemmaStatusText.Text = 'The Ollama helper is unavailable. See the status bar or logs for details.'
         Write-Log -Level 'WARN' -Message ("Gemma preset initialization failed:`n{0}" -f (Get-ErrorDetails -ErrorObject $_))
     }
 
     if ($script:gemmaHelperAvailable) {
-        Set-GemmaUi -StatusText (Get-ReadyGemmaStatusText -Result $script:lastResult) -ResultText ''
+        Set-GemmaUi -StatusText (Get-ReadyGemmaStatusText -Result $script:lastResult) -ResultText '' -ActivityText ''
     }
 
     Update-GemmaButtonState
@@ -2339,13 +3406,15 @@ function Apply-ResultToUi {
     param($Result)
 
     if ($null -eq $Result) {
+        $TitleTextBlock.Text = 'No video loaded.'
+        $VideoIdTextBlock.Text = 'Fetch a video to load metadata.'
         $MetaGrid.ItemsSource = $null
         $ChaptersGrid.ItemsSource = $null
         $DescriptionTextBox.Text = ''
         $TranscriptTextBox.Text = ''
         $TranscriptTimingTextBox.Text = ''
         $TranscriptStatusText.Text = ''
-        Set-GemmaUi -StatusText (Get-ReadyGemmaStatusText -Result $null) -ResultText ''
+        Set-GemmaUi -StatusText (Get-ReadyGemmaStatusText -Result $null) -ResultText '' -ActivityText ''
         Set-WhisperActivityUi -ProgressText 'Whisper idle.' -ActivityText ''
         $RawJsonTextBox.Text = ''
         Update-WhisperButtonState
@@ -2353,13 +3422,20 @@ function Apply-ResultToUi {
         return
     }
 
+    $TitleTextBlock.Text = if ([string]::IsNullOrWhiteSpace([string]$Result.Title)) { 'Untitled video' } else { [string]$Result.Title }
+    $VideoIdTextBlock.Text = if ([string]::IsNullOrWhiteSpace([string]$Result.VideoId)) {
+        ([string]$Result.TranscriptStatus)
+    }
+    else {
+        ("Video ID: {0}" -f [string]$Result.VideoId)
+    }
     $MetaGrid.ItemsSource = $Result.MetaRows
     $ChaptersGrid.ItemsSource = $Result.Chapters
     $DescriptionTextBox.Text = [string]$Result.Description
     $TranscriptTextBox.Text = [string]$Result.Transcript
     $TranscriptTimingTextBox.Text = if ([string]::IsNullOrWhiteSpace([string]$Result.TranscriptTimingJson)) { 'No local Whisper timing metadata loaded.' } else { [string]$Result.TranscriptTimingJson }
     $TranscriptStatusText.Text = Get-TranscriptStatusDisplayText -Result $Result
-    Set-GemmaUi -StatusText (Get-GemmaStatusDisplayText -Result $Result) -ResultText ([string]$Result.GemmaDisplayText)
+    Set-GemmaUi -StatusText (Get-GemmaStatusDisplayText -Result $Result) -ResultText ([string]$Result.GemmaDisplayText) -ActivityText ([string]$Result.GemmaActivityText)
     $RawJsonTextBox.Text = [string]$Result.RawJson
     Update-WhisperButtonState
     Update-GemmaButtonState
@@ -2379,10 +3455,11 @@ $script:gemmaPollTimer.Add_Tick({
     Update-ActiveGemmaRunUi
 })
 Set-WhisperActivityUi -ProgressText 'Whisper idle.' -ActivityText ''
-Set-GemmaUi -StatusText (Get-ReadyGemmaStatusText -Result $null) -ResultText ''
+Set-GemmaUi -StatusText (Get-ReadyGemmaStatusText -Result $null) -ResultText '' -ActivityText ''
 Update-WhisperButtonState
 Update-GemmaButtonState
 Initialize-GemmaPresets
+Initialize-OllamaModels
 
 $FetchButton.Add_Click({
     if ($script:isFetching) {
@@ -2390,7 +3467,7 @@ $FetchButton.Add_Click({
     }
 
     try {
-        $url = $UrlBox.Text.Trim()
+        $url = Resolve-YoutubeInputToUrl -InputText $UrlBox.Text
         Assert-ValidYoutubeUrl -Url $url
 
         $useCookies = [bool]$UseCookiesCheck.IsChecked
@@ -2400,7 +3477,9 @@ $FetchButton.Add_Click({
         $script:isFetching = $true
         $FetchButton.IsEnabled = $false
         $WhisperTranscriptButton.IsEnabled = $false
+        $OpenTranscriptStudioButton.IsEnabled = $false
         $RunGemmaButton.IsEnabled = $false
+        $OllamaModelComboBox.IsEnabled = $false
         $GemmaPresetComboBox.IsEnabled = $false
         $window.Cursor = [System.Windows.Input.Cursors]::Wait
         Set-WhisperActivityUi -ProgressText 'Whisper idle.' -ActivityText ''
@@ -2442,7 +3521,12 @@ $WhisperTranscriptButton.Add_Click({
 
     try {
         $videoId = [string]$script:lastResult.VideoId
-        $url = if ([string]::IsNullOrWhiteSpace([string]$script:lastResult.VideoUrl)) { $UrlBox.Text.Trim() } else { [string]$script:lastResult.VideoUrl }
+        $url = if ([string]::IsNullOrWhiteSpace([string]$script:lastResult.VideoUrl)) {
+            Resolve-YoutubeInputToUrl -InputText $UrlBox.Text
+        }
+        else {
+            [string]$script:lastResult.VideoUrl
+        }
         Assert-ValidYoutubeUrl -Url $url
 
         $useCookies = [bool]$UseCookiesCheck.IsChecked
@@ -2453,7 +3537,9 @@ $WhisperTranscriptButton.Add_Click({
         $script:isTranscribingWhisper = $true
         $FetchButton.IsEnabled = $false
         $WhisperTranscriptButton.IsEnabled = $false
+        $OpenTranscriptStudioButton.IsEnabled = $false
         $RunGemmaButton.IsEnabled = $false
+        $OllamaModelComboBox.IsEnabled = $false
         $GemmaPresetComboBox.IsEnabled = $false
         $window.Cursor = [System.Windows.Input.Cursors]::Wait
         $TranscriptStatusText.Text = 'Preparing local Whisper transcription. The transcript text will update when it finishes.'
@@ -2465,6 +3551,19 @@ $WhisperTranscriptButton.Add_Click({
             $script:isTranscribingWhisper = $false
             $FetchButton.IsEnabled = $true
             $window.Cursor = [System.Windows.Input.Cursors]::Arrow
+            $cachedWhisperRunId = Get-BundleRunId -Prefix 'whisper'
+            $bundleWhisper = Write-BundleWhisperRunArtifacts `
+                -VideoId $videoId `
+                -RunId $cachedWhisperRunId `
+                -Mode 'cached' `
+                -Status 'completed' `
+                -AudioPath ([string]$whisperStart.Result.AudioPath) `
+                -TranscriptPath ([string]$whisperStart.Result.TranscriptPath) `
+                -TimingPath ([string]$whisperStart.Result.TimingPath) `
+                -OutputText 'Loaded cached Whisper transcript.'
+            $whisperStart.Result | Add-Member -NotePropertyName BundleAudioPath -NotePropertyValue ([string]$bundleWhisper.AudioPath) -Force
+            $whisperStart.Result | Add-Member -NotePropertyName BundleTranscriptPath -NotePropertyValue ([string]$bundleWhisper.TranscriptPath) -Force
+            $whisperStart.Result | Add-Member -NotePropertyName BundleTimingPath -NotePropertyValue ([string]$bundleWhisper.TimingPath) -Force
             Apply-WhisperResultToUi -WhisperResult $whisperStart.Result
             Set-WhisperActivityUi -ProgressText 'Loaded cached Whisper transcript.' -ActivityText ("Loaded cached transcript from '{0}'." -f $whisperStart.Result.TranscriptPath)
             Set-Status -Message "Loaded cached local Whisper transcript for video ID: $videoId" -Color 'Green'
@@ -2481,6 +3580,14 @@ $WhisperTranscriptButton.Add_Click({
         $script:activeWhisperTimingPath = [string]$whisperStart.TimingPath
         $script:activeWhisperAudioPath = [string]$whisperStart.AudioPath
         $script:activeWhisperVideoId = $videoId
+        $script:activeWhisperBundleRunId = Get-BundleRunId -Prefix 'whisper'
+        $bundleAudioForStart = Ensure-BundleAudioArtifact -VideoId $videoId -AudioPath ([string]$whisperStart.AudioPath)
+        Add-BundleEvent -VideoId $videoId -Type 'whisper_started' -RunId $script:activeWhisperBundleRunId -Status 'running' -Inputs ([ordered]@{
+            audio = if ([string]::IsNullOrWhiteSpace($bundleAudioForStart)) { '' } else { (Get-RelativePathFromBase -BasePath (Get-VideoBundleDirectory -VideoId $videoId) -TargetPath $bundleAudioForStart) }
+        }) -Details ([ordered]@{
+            model    = $script:guiWhisperModel
+            language = $script:guiWhisperLanguage
+        })
         $TranscriptStatusText.Text = 'Running local Whisper transcription in background. The transcript text will update when it finishes.'
         Set-Status -Message 'Running local Whisper transcription in background...' -Color 'DarkBlue'
         $window.Cursor = [System.Windows.Input.Cursors]::Arrow
@@ -2517,7 +3624,59 @@ $WhisperTranscriptButton.Add_Click({
     }
 })
 
+$OpenTranscriptStudioButton.Add_Click({
+    if ($null -eq $script:lastResult) {
+        return
+    }
+
+    $sessionPath = ''
+    $launchResult = $null
+    $videoId = [string]$script:lastResult.VideoId
+    try {
+        if ([string]::IsNullOrWhiteSpace([string]$script:lastResult.Transcript)) {
+            throw 'Transcript Studio requires transcript text.'
+        }
+
+        $audioPath = [string]$script:lastResult.AudioPath
+        if ([string]::IsNullOrWhiteSpace($audioPath) -or -not (Test-Path -LiteralPath $audioPath -PathType Leaf)) {
+            throw 'Transcript Studio requires a local audio file. Run Whisper first so the GUI has extracted audio to hand off.'
+        }
+
+        $sessionPath = Write-TranscriptStudioSessionFile -Result $script:lastResult
+        $launchResult = Start-TranscriptStudioApp -SessionPath $sessionPath
+        if (-not [string]::IsNullOrWhiteSpace($videoId)) {
+            Add-BundleEvent -VideoId $videoId -Type 'transcript_studio_opened' -Outputs ([ordered]@{
+                session = if ([string]::IsNullOrWhiteSpace([string]$script:lastResult.BundleSessionPath)) { '' } else { (Get-RelativePathFromBase -BasePath (Get-VideoBundleDirectory -VideoId $videoId) -TargetPath ([string]$script:lastResult.BundleSessionPath)) }
+            }) -Details ([ordered]@{
+                processId = $launchResult.Process.Id
+                stdoutLog = if ([string]::IsNullOrWhiteSpace([string]$launchResult.StdOutPath)) { '' } else { (Get-RelativePathFromBase -BasePath (Get-VideoBundleDirectory -VideoId $videoId) -TargetPath ([string]$launchResult.StdOutPath)) }
+                stderrLog = if ([string]::IsNullOrWhiteSpace([string]$launchResult.StdErrPath)) { '' } else { (Get-RelativePathFromBase -BasePath (Get-VideoBundleDirectory -VideoId $videoId) -TargetPath ([string]$launchResult.StdErrPath)) }
+            })
+        }
+        $targetLabel = if ([string]::IsNullOrWhiteSpace($videoId)) { 'current session' } else { "video ID: $videoId" }
+        Set-Status -Message "Opened Transcript Studio for $targetLabel" -Color 'DarkGreen'
+        Write-Log -Level 'INFO' -Message ("Transcript Studio launched. VideoId: {0} | SessionPath: {1} | PID: {2} | stdout: {3} | stderr: {4}" -f $videoId, $sessionPath, $launchResult.Process.Id, [string]$launchResult.StdOutPath, [string]$launchResult.StdErrPath)
+    }
+    catch {
+        Write-Log -Level 'ERROR' -Message ("Transcript Studio launch failed:`n{0}" -f (Get-ErrorDetails -ErrorObject $_))
+        if (-not [string]::IsNullOrWhiteSpace($videoId)) {
+            Add-BundleEvent -VideoId $videoId -Type 'transcript_studio_launch_failed' -Status 'failed' -Outputs ([ordered]@{
+                session = if ([string]::IsNullOrWhiteSpace([string]$script:lastResult.BundleSessionPath)) { '' } elseif (Test-Path -LiteralPath ([string]$script:lastResult.BundleSessionPath) -PathType Leaf) { (Get-RelativePathFromBase -BasePath (Get-VideoBundleDirectory -VideoId $videoId) -TargetPath ([string]$script:lastResult.BundleSessionPath)) } else { '' }
+            }) -Details ([ordered]@{
+                sessionPath = [string]$sessionPath
+                stdoutLog   = if ($null -eq $launchResult) { '' } else { [string]$launchResult.StdOutPath }
+                stderrLog   = if ($null -eq $launchResult) { '' } else { [string]$launchResult.StdErrPath }
+                error       = [string]$_.Exception.Message
+            })
+        }
+        $logHint = if ($script:logPath) { " See log: $script:logPath" } else { '' }
+        Set-Status -Message ($_.Exception.Message + $logHint) -Color 'Red'
+        [System.Windows.MessageBox]::Show(($_.Exception.Message + $logHint), 'Transcript Studio Failed', 'OK', 'Error') | Out-Null
+    }
+})
+
 $GemmaPresetComboBox.Add_SelectionChanged({
+    Update-GemmaPresetTemplateUi
     Update-GemmaButtonState
 
     if ($script:isProcessingGemma -or $null -eq $script:lastResult) {
@@ -2530,6 +3689,24 @@ $GemmaPresetComboBox.Add_SelectionChanged({
     }
 
     if ([string]$script:lastResult.GemmaPresetId -ne $selectedPresetId) {
+        Reset-ResultGemmaState -Result $script:lastResult
+        Apply-ResultToUi -Result $script:lastResult
+    }
+})
+
+$OllamaModelComboBox.Add_SelectionChanged({
+    Update-GemmaButtonState
+
+    if ($script:isProcessingGemma -or $null -eq $script:lastResult) {
+        return
+    }
+
+    $selectedModel = Get-SelectedOllamaModel
+    if ([string]::IsNullOrWhiteSpace($selectedModel)) {
+        return
+    }
+
+    if ([string]$script:lastResult.GemmaModel -ne $selectedModel) {
         Reset-ResultGemmaState -Result $script:lastResult
         Apply-ResultToUi -Result $script:lastResult
     }
@@ -2550,6 +3727,11 @@ $RunGemmaButton.Add_Click({
         return
     }
 
+    $selectedModel = Get-SelectedOllamaModel
+    if ([string]::IsNullOrWhiteSpace($selectedModel)) {
+        return
+    }
+
     try {
         $videoId = [string]$script:lastResult.VideoId
         $transcriptHash = Get-TextSha256 -Text $transcriptText
@@ -2557,18 +3739,36 @@ $RunGemmaButton.Add_Click({
             throw 'The current transcript is empty after normalization.'
         }
 
-        $cachedGemmaResult = Get-CachedGemmaResult -VideoId $videoId -PresetId $presetId -TranscriptHash $transcriptHash
+        $cachedGemmaResult = Get-CachedGemmaResult -VideoId $videoId -Model $selectedModel -PresetId $presetId -TranscriptHash $transcriptHash
         if ($null -ne $cachedGemmaResult) {
-            $cachedStatus = "Loaded cached Gemma 4 result for preset '$presetId'."
-            Apply-GemmaResultToUi -GemmaPayload $cachedGemmaResult.Payload -PresetId $presetId -Status $cachedStatus -ResultPath $cachedGemmaResult.ResultPath
-            Set-Status -Message "Loaded cached Gemma 4 result for video ID: $videoId" -Color 'Green'
-            Write-Log -Level 'INFO' -Message ("Loaded cached Gemma result without starting a new process. VideoId: {0} | Preset: {1}" -f $videoId, $presetId)
+            $cachedLlmRunId = Get-BundleRunId -Prefix 'llm'
+            $bundleLlm = Write-BundleLlmRunArtifacts `
+                -VideoId $videoId `
+                -RunId $cachedLlmRunId `
+                -Mode 'cached' `
+                -Status 'completed' `
+                -Model $selectedModel `
+                -PresetId $presetId `
+                -TranscriptHash $transcriptHash `
+                -TranscriptText $transcriptText `
+                -ResultFilePath $cachedGemmaResult.ResultPath `
+                -ActivityText 'Loaded cached Ollama result.'
+            $cachedStatus = "Loaded cached Ollama result from '$selectedModel' for preset '$presetId'."
+            $cachedActivity = ("[cache]`nLoaded cached Ollama result from '{0}'.`nResult file: {1}" -f $selectedModel, $cachedGemmaResult.ResultPath)
+            Apply-GemmaResultToUi -GemmaPayload $cachedGemmaResult.Payload -Model $selectedModel -PresetId $presetId -Status $cachedStatus -ResultPath $cachedGemmaResult.ResultPath -ActivityText $cachedActivity
+            if ($script:lastResult) {
+                $script:lastResult.BundleLlmResultPath = [string]$bundleLlm.ResultPath
+                $script:lastResult.BundlePromptPath = [string]$bundleLlm.PromptPath
+                $script:lastResult.BundleDisplayPath = [string]$bundleLlm.DisplayPath
+            }
+            Set-Status -Message "Loaded cached Ollama result for video ID: $videoId" -Color 'Green'
+            Write-Log -Level 'INFO' -Message ("Loaded cached Ollama result without starting a new process. VideoId: {0} | Preset: {1} | Model: {2}" -f $videoId, $presetId, $selectedModel)
             Update-GemmaButtonState
             return
         }
 
-        $resultPath = Get-GuiGemmaResultPath -VideoId $videoId -Model $script:ollamaModel -PresetId $presetId -TranscriptHash $transcriptHash
-        $inputPath = Get-GuiGemmaInputPath -VideoId $videoId -Model $script:ollamaModel -PresetId $presetId -TranscriptHash $transcriptHash
+        $resultPath = Get-GuiGemmaResultPath -VideoId $videoId -Model $selectedModel -PresetId $presetId -TranscriptHash $transcriptHash
+        $inputPath = Get-GuiGemmaInputPath -VideoId $videoId -Model $selectedModel -PresetId $presetId -TranscriptHash $transcriptHash
         $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $stdoutPath = Join-Path $script:logDir ("gemma-{0}-{1}.stdout.log" -f $videoId, $timestamp)
         $stderrPath = Join-Path $script:logDir ("gemma-{0}-{1}.stderr.log" -f $videoId, $timestamp)
@@ -2576,25 +3776,31 @@ $RunGemmaButton.Add_Click({
         Write-TextFileUtf8 -Path $inputPath -Text (Normalize-TranscriptSourceText -Text $transcriptText)
         $gemmaArgs = @(
             'run',
-            '--model', $script:ollamaModel,
+            '--model', $selectedModel,
             '--preset', $presetId,
             '--input-file', $inputPath,
             '--output-file', $resultPath,
             '--timeout-seconds', [string]$script:ollamaTimeoutSeconds
         )
 
-        Write-Log -Level 'INFO' -Message ("Gemma 4 processing requested. VideoId: {0} | Preset: {1} | Model: {2}" -f $videoId, $presetId, $script:ollamaModel)
+        Write-Log -Level 'INFO' -Message ("Ollama processing requested. VideoId: {0} | Preset: {1} | Model: {2}" -f $videoId, $presetId, $selectedModel)
         $script:isProcessingGemma = $true
         $FetchButton.IsEnabled = $false
         $WhisperTranscriptButton.IsEnabled = $false
+        $OpenTranscriptStudioButton.IsEnabled = $false
         $RunGemmaButton.IsEnabled = $false
+        $OllamaModelComboBox.IsEnabled = $false
         $GemmaPresetComboBox.IsEnabled = $false
         $window.Cursor = [System.Windows.Input.Cursors]::Wait
         if ($script:lastResult) {
-            $script:lastResult.GemmaStatus = "Preparing Gemma 4 preset '$presetId'..."
+            $script:lastResult.GemmaDisplayText = ''
+            $script:lastResult.GemmaActivityText = ("[request]`nModel: {0}`nPreset: {1}`nTranscript hash: {2}" -f $selectedModel, $presetId, $transcriptHash)
+            $script:lastResult.GemmaStatus = "Preparing Ollama model '$selectedModel' for preset '$presetId'..."
+            $script:lastResult.GemmaModel = $selectedModel
+            $script:lastResult.GemmaPresetId = $presetId
             Apply-ResultToUi -Result $script:lastResult
         }
-        Set-Status -Message 'Preparing Gemma 4 transcript post-processing...' -Color 'DarkBlue'
+        Set-Status -Message 'Preparing Ollama transcript post-processing...' -Color 'DarkBlue'
 
         $processStart = Start-LocalLlmTool -Arguments $gemmaArgs -StdOutPath $stdoutPath -StdErrPath $stderrPath
         $script:activeGemmaProcess = $processStart.Process
@@ -2604,21 +3810,28 @@ $RunGemmaButton.Add_Click({
         $script:activeGemmaInputPath = [string]$inputPath
         $script:activeGemmaVideoId = [string]$videoId
         $script:activeGemmaPresetId = [string]$presetId
+        $script:activeGemmaModel = [string]$selectedModel
         $script:activeGemmaTranscriptHash = [string]$transcriptHash
+        $script:activeGemmaBundleRunId = Get-BundleRunId -Prefix 'llm'
+        Add-BundleEvent -VideoId $videoId -Type 'llm_started' -RunId $script:activeGemmaBundleRunId -Status 'running' -Details ([ordered]@{
+            model          = [string]$selectedModel
+            presetId       = [string]$presetId
+            transcriptHash = [string]$transcriptHash
+        })
         if ($script:lastResult) {
-            $script:lastResult.GemmaStatus = "Running Gemma 4 preset '$presetId' in the background."
+            $script:lastResult.GemmaStatus = "Waiting for Ollama model '$selectedModel' to respond..."
             Apply-ResultToUi -Result $script:lastResult
         }
-        Set-Status -Message 'Running Gemma 4 in the background...' -Color 'DarkBlue'
+        Set-Status -Message ("Running Ollama model '{0}' in the background..." -f $selectedModel) -Color 'DarkBlue'
         $window.Cursor = [System.Windows.Input.Cursors]::Arrow
         Update-WhisperButtonState
         Update-GemmaButtonState
         Update-ActiveGemmaRunUi
         $script:gemmaPollTimer.Start()
-        Write-Log -Level 'INFO' -Message ("Gemma helper process started. VideoId: {0} | Preset: {1} | PID: {2}" -f $videoId, $presetId, $script:activeGemmaProcess.Id)
+        Write-Log -Level 'INFO' -Message ("Ollama helper process started. VideoId: {0} | Preset: {1} | Model: {2} | PID: {3}" -f $videoId, $presetId, $selectedModel, $script:activeGemmaProcess.Id)
     }
     catch {
-        Write-Log -Level 'ERROR' -Message ("Gemma 4 processing failed:`n{0}" -f (Get-ErrorDetails -ErrorObject $_))
+        Write-Log -Level 'ERROR' -Message ("Ollama processing failed:`n{0}" -f (Get-ErrorDetails -ErrorObject $_))
         if ($script:activeGemmaProcess) {
             try {
                 $script:activeGemmaProcess.Refresh()
@@ -2634,15 +3847,28 @@ $RunGemmaButton.Add_Click({
         $FetchButton.IsEnabled = $true
         $window.Cursor = [System.Windows.Input.Cursors]::Arrow
         if ($script:lastResult) {
-            $script:lastResult.GemmaStatus = 'Gemma 4 failed.'
+            $script:lastResult.GemmaStatus = 'Ollama failed.'
+            $script:lastResult.GemmaModel = $selectedModel
             Apply-ResultToUi -Result $script:lastResult
         }
         $logHint = if ($script:logPath) { " See log: $script:logPath" } else { '' }
         Set-Status -Message ($_.Exception.Message + $logHint) -Color 'Red'
-        [System.Windows.MessageBox]::Show(($_.Exception.Message + $logHint), 'Gemma 4 Failed', 'OK', 'Error') | Out-Null
+        [System.Windows.MessageBox]::Show(($_.Exception.Message + $logHint), 'Ollama Failed', 'OK', 'Error') | Out-Null
         Update-WhisperButtonState
         Update-GemmaButtonState
     }
+})
+
+$StopGemmaButton.Add_Click({
+    if (-not $script:isProcessingGemma) {
+        return
+    }
+
+    Stop-ActiveGemmaRun -Reason 'Ollama run stopped by user.'
+})
+
+$UseCookiesCheck.Add_Checked({
+    $BrowserOptionsExpander.IsExpanded = $true
 })
 
 $BrowseProfileButton.Add_Click({
@@ -2658,6 +3884,7 @@ $BrowseProfileButton.Add_Click({
     if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
         $ProfilePathBox.Text = $dialog.SelectedPath
         $UseCookiesCheck.IsChecked = $true
+        $BrowserOptionsExpander.IsExpanded = $true
         Write-Log -Level 'INFO' -Message ("Firefox profile selected via UI: {0}" -f $dialog.SelectedPath)
     }
 })
@@ -2719,12 +3946,12 @@ $window.Add_Closing({
         try {
             $script:activeGemmaProcess.Refresh()
             if (-not $script:activeGemmaProcess.HasExited) {
-                Write-Log -Level 'WARN' -Message ("Stopping active Gemma helper because the window is closing. PID: {0}" -f $script:activeGemmaProcess.Id)
+                Write-Log -Level 'WARN' -Message ("Stopping active Ollama helper because the window is closing. PID: {0}" -f $script:activeGemmaProcess.Id)
                 $script:activeGemmaProcess.Kill()
             }
         }
         catch {
-            Write-Log -Level 'WARN' -Message ("Failed to stop active Gemma helper during window close:`n{0}" -f (Get-ErrorDetails -ErrorObject $_))
+            Write-Log -Level 'WARN' -Message ("Failed to stop active Ollama helper during window close:`n{0}" -f (Get-ErrorDetails -ErrorObject $_))
         }
         finally {
             Clear-ActiveGemmaRunState

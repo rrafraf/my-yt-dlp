@@ -12,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
 from tools.whisper_transcribe_core.core import (
     add_ffmpeg_to_path,
     configure_stdio,
+    get_whisper_model_cache_dir,
     load_whisper_model,
     transcribe_audio,
     write_transcription_outputs,
@@ -40,7 +41,8 @@ def main() -> int:
         print(f"Audio file not found: {audio_path}", file=sys.stderr)
         return 1
 
-    print(f"Loading Whisper model '{args.model}'...")
+    model_cache_dir = get_whisper_model_cache_dir()
+    print(f"Loading Whisper model '{args.model}' from '{model_cache_dir}'...")
     try:
         add_ffmpeg_to_path(args.ffmpeg_dir)
     except Exception:

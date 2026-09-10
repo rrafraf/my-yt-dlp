@@ -18,6 +18,36 @@
       "createTemporaryIntegratedConsole": true
     },
     {
+      "name": "Launch Transcript Studio",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "transcript_studio.cli",
+      "cwd": "${workspaceFolder}/tools/transcript_studio",
+      "python": "${workspaceFolder}/tools/transcript_studio/.venv/Scripts/python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/tools/transcript_studio/src"
+      }
+    },
+    {
+      "name": "Launch Transcript Studio (session file)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "transcript_studio.cli",
+      "cwd": "${workspaceFolder}/tools/transcript_studio",
+      "python": "${workspaceFolder}/tools/transcript_studio/.venv/Scripts/python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--session",
+        "${input:transcriptStudioSessionPath}"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/tools/transcript_studio/src"
+      }
+    },
+    {
       "name": "Debug whatsapp_transcribe.py",
       "type": "debugpy",
       "request": "launch",
@@ -32,6 +62,14 @@
       "program": "${workspaceFolder}/tools/music_transcribe/music_transcribe.py",
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}/tools/music_transcribe"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "transcriptStudioSessionPath",
+      "type": "promptString",
+      "description": "Path to a Transcript Studio session JSON file",
+      "default": "${workspaceFolder}\\yt-research-gui\\data\\transcript-studio\\"
     }
   ]
 }

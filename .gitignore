@@ -26,6 +26,7 @@ Transcripts/
 logs/
 yt-research-gui-data/
 yt-research-gui/.venv/
+tools/transcript_studio/.venv/
 yt-research-gui/data/
 yt-research-gui/logs/
 

@@ -1,0 +1,16 @@
+[project]
+name = "transcript-studio"
+version = "0.1.0"
+description = "Interactive Qt transcript exploration tool for Whisper timing data"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.8,<7",
+]
+
+[project.scripts]
+transcript-studio = "transcript_studio.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10.8,<0.11.0"]
+build-backend = "uv_build"
