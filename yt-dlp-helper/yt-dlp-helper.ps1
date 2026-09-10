@@ -1,12 +1,12 @@
 #Requires -Version 5.0
 param(
-    [switch]$TreatYtDlpErrorsAsWarnings = $false  # If true, yt-dlp non-zero exit codes will be warnings instead of errors
+    [switch]$TreatYtDlpErrorsAsWarnings = $false
 )
 
-<#
-.SYNOPSIS
-    yt-dlp Helper Script for YouTube Downloads with improved error handling
+. (Join-Path $PSScriptRoot 'Helper.Core.ps1')
+Initialize-HelperCore -Mode cli -TreatYtDlpErrorsAsWarnings:$TreatYtDlpErrorsAsWarnings
 
+<<<<<<< Updated upstream
 .DESCRIPTION
     This script provides a menu-driven interface for downloading YouTube videos and playlists using yt-dlp.
     It includes automatic yt-dlp updates, FFmpeg setup, and robust error handling for unavailable videos.
@@ -1589,31 +1589,43 @@ function Get-MyPlaylistsAndDownload {
 # --- Script Main Execution ---
 
 # Helper: read menu choice with Esc handling
+=======
+>>>>>>> Stashed changes
 function Read-MenuInput {
-    [CmdletBinding()]
     param(
-        [Parameter(Mandatory=$true)] [string]$Prompt,
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
         [string]$Default
     )
-    # Show prompt
+
     Write-Host $Prompt -NoNewline
     $builder = [System.Text.StringBuilder]::new()
     $usedDefault = $false
+
     while ($true) {
         $keyInfo = [System.Console]::ReadKey($true)
         switch ($keyInfo.Key) {
             'Escape' {
-                Write-Host ""
-                return [pscustomobject]@{ Escaped = $true; Input = $null; UsedDefault = $false }
+                Write-Host ''
+                return [pscustomobject]@{
+                    Escaped     = $true
+                    Input       = $null
+                    UsedDefault = $false
+                }
             }
             'Enter' {
-                Write-Host ""
+                Write-Host ''
                 $text = $builder.ToString()
                 if ([string]::IsNullOrWhiteSpace($text) -and -not [string]::IsNullOrWhiteSpace($Default)) {
                     $text = $Default
                     $usedDefault = $true
                 }
-                return [pscustomobject]@{ Escaped = $false; Input = $text; UsedDefault = $usedDefault }
+
+                return [pscustomobject]@{
+                    Escaped     = $false
+                    Input       = $text
+                    UsedDefault = $usedDefault
+                }
             }
             'Backspace' {
                 if ($builder.Length -gt 0) {
@@ -1621,7 +1633,7 @@ function Read-MenuInput {
                     Write-Host "`b `b" -NoNewline
                 }
             }
-            Default {
+            default {
                 if ($keyInfo.KeyChar) {
                     [void]$builder.Append($keyInfo.KeyChar)
                     Write-Host $keyInfo.KeyChar -NoNewline
@@ -1631,78 +1643,452 @@ function Read-MenuInput {
     }
 }
 
-Write-Host "`nPlease choose an action:" -ForegroundColor Green
-Write-Host "1. Download Single Video (Best Quality + Metadata)"
-Write-Host "2. Download Playlist by URL (Best Quality + Metadata)"
-if ($script:authAvailable) {
-    Write-Host "3. List & Download My Playlist (Requires Auth)"
-    Write-Host "4. List & Download My Playlist (Refresh Cache)"
-} else {
-    Write-Host "3. List & Download My Playlist (Requires Auth) - Unavailable (Firefox auth unavailable)" -ForegroundColor DarkGray
-    Write-Host "4. List & Download My Playlist (Refresh Cache) - Unavailable (Firefox auth unavailable)" -ForegroundColor DarkGray
+function Prompt-ForDownloadRoot {
+    $defaultRoot = Get-HelperDefaultDownloadRoot
+    $enteredRoot = Read-Host "Enter download root directory (press Enter to use last/default): [$defaultRoot]"
+    if ([string]::IsNullOrWhiteSpace($enteredRoot)) {
+        $enteredRoot = $defaultRoot
+    }
+
+    try {
+        return (Resolve-HelperDownloadRootPath -DownloadRoot $enteredRoot)
+    }
+    catch {
+        Write-Warning ("The entered download root was not usable. Falling back to '{0}'. Error: {1}" -f $defaultRoot, $_.Exception.Message)
+        return (Resolve-HelperDownloadRootPath -DownloadRoot $defaultRoot)
+    }
 }
 
-$defaultChoice = if ($script:lastChoice) { $script:lastChoice } else { "" }
+function Read-ManualFirefoxProfilePath {
+    param([string]$DefaultPath)
+
+    while ($true) {
+        $promptSuffix = if ([string]::IsNullOrWhiteSpace($DefaultPath)) { '' } else { " [$DefaultPath]" }
+        $manualPath = Read-Host "Enter the full Firefox profile folder path$promptSuffix"
+
+        if ([string]::IsNullOrWhiteSpace($manualPath)) {
+            if (-not [string]::IsNullOrWhiteSpace($DefaultPath)) {
+                $manualPath = $DefaultPath
+            }
+            else {
+                Write-Warning 'Please enter a Firefox profile folder path.'
+                continue
+            }
+        }
+
+        $validation = Test-FirefoxProfilePath -ProfilePath $manualPath
+        if ($validation.IsValid) {
+            return $validation.ProfilePath
+        }
+
+        Write-Warning ("That Firefox profile path is not usable ({0})." -f $validation.StatusMessage)
+    }
+}
+
+function Select-FirefoxProfilePath {
+    param(
+        [string]$CurrentPath,
+        [string]$CurrentStatusMessage
+    )
+
+    $detectedProfiles = @(Get-FirefoxProfileCandidates)
+
+    Write-Host ''
+    Write-Host 'Firefox profile setup:' -ForegroundColor Magenta
+    if (-not [string]::IsNullOrWhiteSpace($CurrentStatusMessage)) {
+        Write-Host ("Current status: {0}" -f $CurrentStatusMessage) -ForegroundColor DarkYellow
+    }
+
+    if ($detectedProfiles.Count -gt 0) {
+        Write-Host 'Detected Firefox profiles:' -ForegroundColor Cyan
+        $index = 1
+        foreach ($profile in $detectedProfiles) {
+            $markers = @()
+            if ($profile.IsDefault) { $markers += 'Default' }
+            if (-not [string]::IsNullOrWhiteSpace($CurrentPath) -and $profile.Path -ieq $CurrentPath) { $markers += 'Current' }
+            $markerText = if ($markers.Count -gt 0) { " [{0}]" -f ($markers -join ', ') } else { '' }
+            $sourceText = if ([string]::IsNullOrWhiteSpace($profile.Source)) { '' } else { " ($($profile.Source))" }
+            $nameText = if ($profile.Name -and $profile.Name -ne $profile.ProfileName) {
+                "$($profile.Name) [$($profile.ProfileName)]"
+            }
+            else {
+                $profile.ProfileName
+            }
+
+            Write-Host ("{0}. {1}{2}{3}" -f $index, $nameText, $markerText, $sourceText)
+            Write-Host ("    {0}" -f $profile.Path) -ForegroundColor DarkGray
+            $index++
+        }
+    }
+    else {
+        Write-Host 'No Firefox profiles were detected automatically.' -ForegroundColor DarkYellow
+    }
+
+    Write-Host 'M. Enter a profile path manually'
+    Write-Host 'S. Skip authentication for this run'
+
+    while ($true) {
+        $selectionPrompt = if ($detectedProfiles.Count -gt 0) {
+            "Select a Firefox profile (1-$($detectedProfiles.Count), M, or S)"
+        }
+        else {
+            'Select M to enter a path manually or S to skip'
+        }
+
+        $selection = Read-Host $selectionPrompt
+        $normalizedSelection = if ($null -eq $selection) { '' } else { $selection.Trim() }
+
+        if ($normalizedSelection -match '^[Mm]$') {
+            return [pscustomobject]@{
+                Action = 'UsePath'
+                Path   = (Read-ManualFirefoxProfilePath -DefaultPath $CurrentPath)
+            }
+        }
+
+        if ($normalizedSelection -match '^[Ss]$') {
+            return [pscustomobject]@{
+                Action = 'Skip'
+                Path   = $null
+            }
+        }
+
+        $parsedIndex = 0
+        if ($detectedProfiles.Count -gt 0 -and [int]::TryParse($normalizedSelection, [ref]$parsedIndex)) {
+            if ($parsedIndex -ge 1 -and $parsedIndex -le $detectedProfiles.Count) {
+                return [pscustomobject]@{
+                    Action = 'UsePath'
+                    Path   = $detectedProfiles[$parsedIndex - 1].Path
+                }
+            }
+        }
+
+        Write-Warning 'Please enter a valid selection.'
+    }
+}
+
+function Resolve-InteractiveFirefoxProfile {
+    $initialValidation = Test-FirefoxProfilePath -ProfilePath $script:helperState.firefoxProfilePath
+    $selectedProfilePath = $script:helperState.firefoxProfilePath
+
+    if ($initialValidation.IsValid) {
+        Write-Host ("Saved Firefox profile: {0}" -f $initialValidation.ProfilePath) -ForegroundColor DarkGray
+        $profilePromptChoice = Read-Host 'Press Enter to keep it, C to choose a detected profile, M to enter a new path, or S to skip auth for this run'
+        $normalizedChoice = if ($null -eq $profilePromptChoice) { '' } else { $profilePromptChoice.Trim().ToUpperInvariant() }
+
+        switch ($normalizedChoice) {
+            '' { }
+            'C' {
+                $selectionResult = Select-FirefoxProfilePath -CurrentPath $initialValidation.ProfilePath
+                if ($selectionResult.Action -eq 'Skip') {
+                    return $null
+                }
+                $selectedProfilePath = $selectionResult.Path
+            }
+            'M' {
+                $selectedProfilePath = Read-ManualFirefoxProfilePath -DefaultPath $initialValidation.ProfilePath
+            }
+            'S' {
+                return $null
+            }
+            default {
+                Write-Warning ("Unrecognized choice '{0}'. Keeping the saved Firefox profile." -f $profilePromptChoice)
+                $selectedProfilePath = $initialValidation.ProfilePath
+            }
+        }
+    }
+    else {
+        if ([string]::IsNullOrWhiteSpace($script:helperState.firefoxProfilePath)) {
+            Write-Warning 'No Firefox profile is configured for YouTube authentication.'
+        }
+        else {
+            Write-Warning ("Saved Firefox profile is not usable ({0})." -f $initialValidation.StatusMessage)
+        }
+
+        $selectionResult = Select-FirefoxProfilePath -CurrentPath $script:helperState.firefoxProfilePath -CurrentStatusMessage $initialValidation.StatusMessage
+        if ($selectionResult.Action -eq 'Skip') {
+            return $null
+        }
+
+        $selectedProfilePath = $selectionResult.Path
+    }
+
+    $finalValidation = Test-FirefoxProfilePath -ProfilePath $selectedProfilePath
+    if (-not $finalValidation.IsValid) {
+        Write-Warning ("No Firefox profile available for YouTube authentication ({0})." -f $finalValidation.StatusMessage)
+        return $null
+    }
+
+    Save-HelperPreferences -FirefoxProfilePath $finalValidation.ProfilePath
+    return $finalValidation.ProfilePath
+}
+
+function Write-OperationSummary {
+    param([object]$Result)
+
+    if ($null -eq $Result) {
+        return
+    }
+
+    if ($Result.Succeeded) {
+        Write-Host $Result.Status -ForegroundColor Green
+    }
+    else {
+        Write-Error $Result.Status
+    }
+
+    foreach ($warning in @($Result.Warnings)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$warning)) {
+            Write-Warning ([string]$warning)
+        }
+    }
+}
+
+function Choose-PlaylistFromResult {
+    param([object]$PlaylistResult)
+
+    $playlists = @($PlaylistResult.Data.Playlists)
+    if ($playlists.Count -eq 0) {
+        Write-Warning 'No playlists found.'
+        return $null
+    }
+
+    $pageSize = 20
+    $currentPage = 0
+    $totalPages = [Math]::Ceiling($playlists.Count / $pageSize)
+    $defaultPlaylistIndex = [string]$script:helperState.lastPlaylistIndex
+    $defaultPlaylistId = [string]$script:helperState.lastPlaylistId
+    $foundDefaultIndex = $null
+
+    if (-not [string]::IsNullOrWhiteSpace($defaultPlaylistId)) {
+        for ($i = 0; $i -lt $playlists.Count; $i++) {
+            if ($playlists[$i].PlaylistId -eq $defaultPlaylistId) {
+                $foundDefaultIndex = $i + 1
+                $currentPage = [Math]::Floor($i / $pageSize)
+                break
+            }
+        }
+    }
+
+    while ($true) {
+        $startIndex = $currentPage * $pageSize
+        $endIndex = [Math]::Min($startIndex + $pageSize - 1, $playlists.Count - 1)
+
+        Write-Host ''
+        Write-Host ("Your Playlists (Page {0} of {1}):" -f ($currentPage + 1), $totalPages) -ForegroundColor Green
+        for ($i = $startIndex; $i -le $endIndex; $i++) {
+            $row = $playlists[$i]
+            $prefix = if ($foundDefaultIndex -and ($i + 1) -eq $foundDefaultIndex) { '->' } else { '  ' }
+            Write-Host ("{0} {1,3}. {2}" -f $prefix, ($i + 1), $row.Title)
+        }
+
+        if ($currentPage -lt $totalPages - 1) {
+            $prompt = 'Enter playlist number to download, press Enter for next page, or q to quit'
+        }
+        else {
+            $prompt = 'Enter playlist number to download or q to quit (last page)'
+        }
+
+        if ($foundDefaultIndex) {
+            $prompt += " [Last: $foundDefaultIndex]"
+        }
+        elseif ($defaultPlaylistIndex -and $currentPage -eq 0) {
+            $prompt += " [Last: $defaultPlaylistIndex]"
+        }
+
+        $selection = Read-Host $prompt
+        if ([string]::IsNullOrWhiteSpace($selection)) {
+            if ($foundDefaultIndex) {
+                $selection = [string]$foundDefaultIndex
+                Write-Host ("Using last playlist choice: {0}" -f $selection) -ForegroundColor DarkGray
+                return $playlists[[int]$selection - 1]
+            }
+            if ($defaultPlaylistIndex -and $currentPage -eq 0) {
+                $selection = [string]$defaultPlaylistIndex
+                Write-Host ("Using last playlist choice: {0}" -f $selection) -ForegroundColor DarkGray
+                return $playlists[[int]$selection - 1]
+            }
+            if ($currentPage -lt $totalPages - 1) {
+                $currentPage++
+                continue
+            }
+            Write-Host 'Last page reached.' -ForegroundColor Yellow
+            continue
+        }
+
+        if ($selection -eq 'q') {
+            Write-Host 'Download cancelled.'
+            return $null
+        }
+
+        $parsed = 0
+        if ([int]::TryParse($selection, [ref]$parsed) -and $parsed -ge 1 -and $parsed -le $playlists.Count) {
+            return $playlists[$parsed - 1]
+        }
+
+        Write-Warning 'Invalid input. Please enter a valid playlist number, press Enter for next page, or q to quit.'
+    }
+}
+
+$downloadRoot = Prompt-ForDownloadRoot
+Write-Host ("Using download root: {0}" -f $downloadRoot) -ForegroundColor Cyan
+
+$treatWarnings = if ($TreatYtDlpErrorsAsWarnings) {
+    $true
+}
+else {
+    [bool]$script:helperState.treatYtDlpErrorsAsWarningsPreferred
+}
+if ($TreatYtDlpErrorsAsWarnings) {
+    Save-HelperPreferences -TreatWarningsPreferred $true
+}
+
+$authProfilePath = Resolve-InteractiveFirefoxProfile
+$authAvailable = -not [string]::IsNullOrWhiteSpace($authProfilePath)
+
+Write-Host ''
+Write-Host 'Please choose an action:' -ForegroundColor Green
+Write-Host '1. Download Single Video (Best Quality + Metadata)'
+Write-Host '2. Download Playlist by URL (Best Quality + Metadata)'
+if ($authAvailable) {
+    Write-Host '3. List & Download My Playlist (Requires Auth)'
+    Write-Host '4. List & Download My Playlist (Refresh Cache)'
+}
+else {
+    Write-Host '3. List & Download My Playlist (Requires Auth) - Unavailable (Firefox auth unavailable)' -ForegroundColor DarkGray
+    Write-Host '4. List & Download My Playlist (Refresh Cache) - Unavailable (Firefox auth unavailable)' -ForegroundColor DarkGray
+}
+
+$defaultChoice = if ($script:helperState.lastChoice) { [string]$script:helperState.lastChoice } else { '' }
 $menuPrompt = "Enter your choice (1, 2, 3, or 4)$(if ($defaultChoice) { " [Last: $defaultChoice]" }) (Esc to exit): "
 $menuInput = Read-MenuInput -Prompt $menuPrompt -Default $defaultChoice
 if ($menuInput.Escaped) {
-    Write-Host "Exiting by user request." -ForegroundColor Cyan
+    Write-Host 'Exiting by user request.' -ForegroundColor Cyan
     return
 }
-$choice = $menuInput.Input
 
-# If empty input and we have a default, use the default
+$choice = [string]$menuInput.Input
 if ($menuInput.UsedDefault) {
-    Write-Host "Using last choice: $choice" -ForegroundColor DarkGray
-} elseif ([string]::IsNullOrWhiteSpace($choice) -and $defaultChoice) {
+    Write-Host ("Using last choice: {0}" -f $choice) -ForegroundColor DarkGray
+}
+elseif ([string]::IsNullOrWhiteSpace($choice) -and $defaultChoice) {
     $choice = $defaultChoice
-    Write-Host "Using last choice: $choice" -ForegroundColor DarkGray
+    Write-Host ("Using last choice: {0}" -f $choice) -ForegroundColor DarkGray
 }
 
 try {
-    # Save user's menu choice (keep per-root and global in sync)
     if (-not [string]::IsNullOrWhiteSpace($choice)) {
-        if ($TreatYtDlpErrorsAsWarnings) { $script:treatYtDlpErrorsAsWarningsPref = $true }
-        Save-UserPreferences -menuChoice $choice -playlistIndex $script:lastPlaylistIndex -playlistId $script:lastPlaylistId -downloadRoot $script:downloadRootPath
+        Save-HelperPreferences -MenuChoice $choice -DownloadRoot $downloadRoot -TreatWarningsPreferred $treatWarnings
     }
 
-    # Pass the confirmed yt-dlp path and separated auth info
     switch ($choice) {
-        "1" {
-            Write-Host "Selected: Download Single Video" -ForegroundColor Yellow
-            Download-BestVideo -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
-        }
-        "2" {
-            Write-Host "Selected: Download Playlist by URL" -ForegroundColor Yellow
-            Download-Playlist -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp -PromptMetadataAfter
-        }
-        "3" {
-            if (-not $script:authAvailable) {
-                Write-Warning "Option 3 is unavailable because Firefox-cookie authentication is not available. Running in public-only mode."
+        '1' {
+            $videoUrl = Read-Host 'Please enter the YouTube video URL'
+            if ([string]::IsNullOrWhiteSpace($videoUrl)) {
+                Write-Warning 'No URL provided. Exiting.'
                 break
             }
-            Write-Host "Selected: List & Download My Playlist" -ForegroundColor Yellow
-            Get-MyPlaylistsAndDownload -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
+
+            $result = Invoke-HelperOperation -Request @{
+                Kind                    = 'single-video'
+                Url                     = $videoUrl
+                DownloadRoot            = $downloadRoot
+                UseCookies              = $authAvailable
+                FirefoxProfilePath      = $authProfilePath
+                TreatWarningsAsNonFatal = $treatWarnings
+            }
+            Write-OperationSummary -Result $result
         }
-        "4" {
-            if (-not $script:authAvailable) {
-                Write-Warning "Option 4 is unavailable because Firefox-cookie authentication is not available. Running in public-only mode."
+        '2' {
+            $playlistUrl = Read-Host 'Please enter the YouTube playlist URL'
+            if ([string]::IsNullOrWhiteSpace($playlistUrl)) {
+                Write-Warning 'No URL provided. Exiting.'
                 break
             }
-            Write-Host "Selected: List & Download My Playlist (Force Refresh Cache)" -ForegroundColor Yellow
-            Get-MyPlaylistsAndDownload -ffmpegLocationArg $ffmpegLocationArgument -commonArgs $commonFlagsCore -authTypeValue $authType -authPathValue $authValue -ytDlpPath $ytDlpExePath -ForceRefreshCache -TreatErrorsAsWarnings:$script:useWarningsForYtDlp
+
+            $fetchSidecars = ((Read-Host 'Also fetch metadata and subtitles/transcripts now? (y/N)') -match '^(?i:y|yes)$')
+            $result = Invoke-HelperOperation -Request @{
+                Kind                    = 'playlist-url'
+                Url                     = $playlistUrl
+                DownloadRoot            = $downloadRoot
+                UseCookies              = $authAvailable
+                FirefoxProfilePath      = $authProfilePath
+                TreatWarningsAsNonFatal = $treatWarnings
+                FetchSidecars           = $fetchSidecars
+            }
+            Write-OperationSummary -Result $result
+        }
+        '3' {
+            if (-not $authAvailable) {
+                Write-Warning 'Option 3 is unavailable because Firefox-cookie authentication is not available.'
+                break
+            }
+
+            $playlistsResult = Invoke-HelperOperation -Request @{
+                Kind                    = 'my-playlists'
+                DownloadRoot            = $downloadRoot
+                FirefoxProfilePath      = $authProfilePath
+                TreatWarningsAsNonFatal = $treatWarnings
+                ForceRefreshCache       = $false
+            }
+            Write-OperationSummary -Result $playlistsResult
+            $selectedPlaylist = Choose-PlaylistFromResult -PlaylistResult $playlistsResult
+            if ($null -eq $selectedPlaylist) {
+                break
+            }
+
+            Save-HelperPreferences -MenuChoice '3' -PlaylistIndex ([string]$selectedPlaylist.Index) -PlaylistId ([string]$selectedPlaylist.PlaylistId) -DownloadRoot $downloadRoot
+            $fetchSidecars = ((Read-Host 'Also fetch metadata and subtitles/transcripts now? (y/N)') -match '^(?i:y|yes)$')
+            $downloadResult = Invoke-HelperOperation -Request @{
+                Kind                    = 'playlist-url'
+                Url                     = [string]$selectedPlaylist.Url
+                DownloadRoot            = $downloadRoot
+                UseCookies              = $true
+                FirefoxProfilePath      = $authProfilePath
+                TreatWarningsAsNonFatal = $treatWarnings
+                FetchSidecars           = $fetchSidecars
+            }
+            Write-OperationSummary -Result $downloadResult
+        }
+        '4' {
+            if (-not $authAvailable) {
+                Write-Warning 'Option 4 is unavailable because Firefox-cookie authentication is not available.'
+                break
+            }
+
+            $playlistsResult = Invoke-HelperOperation -Request @{
+                Kind                    = 'my-playlists'
+                DownloadRoot            = $downloadRoot
+                FirefoxProfilePath      = $authProfilePath
+                TreatWarningsAsNonFatal = $treatWarnings
+                ForceRefreshCache       = $true
+            }
+            Write-OperationSummary -Result $playlistsResult
+            $selectedPlaylist = Choose-PlaylistFromResult -PlaylistResult $playlistsResult
+            if ($null -eq $selectedPlaylist) {
+                break
+            }
+
+            Save-HelperPreferences -MenuChoice '4' -PlaylistIndex ([string]$selectedPlaylist.Index) -PlaylistId ([string]$selectedPlaylist.PlaylistId) -DownloadRoot $downloadRoot
+            $fetchSidecars = ((Read-Host 'Also fetch metadata and subtitles/transcripts now? (y/N)') -match '^(?i:y|yes)$')
+            $downloadResult = Invoke-HelperOperation -Request @{
+                Kind                    = 'playlist-url'
+                Url                     = [string]$selectedPlaylist.Url
+                DownloadRoot            = $downloadRoot
+                UseCookies              = $true
+                FirefoxProfilePath      = $authProfilePath
+                TreatWarningsAsNonFatal = $treatWarnings
+                FetchSidecars           = $fetchSidecars
+            }
+            Write-OperationSummary -Result $downloadResult
         }
         default {
-            Write-Warning "Invalid choice. Exiting."
+            Write-Warning 'Invalid choice. Exiting.'
         }
     }
 }
 catch [System.Management.Automation.PipelineStoppedException] {
-    Write-Warning "Script execution stopped by user (Ctrl+C)."
+    Write-Warning 'Script execution stopped by user (Ctrl+C).'
 }
 catch {
-    Write-Error "An unexpected error occurred in the main script body: $($_.Exception.Message)"
-}
-finally {
-    Write-Host "Script finished or exited." -ForegroundColor Cyan
+    Write-Error ("An unexpected error occurred: {0}" -f $_.Exception.Message)
 }

@@ -1,11 +1,6 @@
-﻿## my-yt-dlp Helper (Windows)
+## my-yt-dlp
 
-A Windows-focused toolkit to:
-- Automatically fetch and keep `yt-dlp.exe` up to date (nightly builds)
-- Automatically download and wire up a portable FFmpeg for `yt-dlp`
-- Download YouTube videos or playlists (with metadata, thumbnails, subtitles, and duplicate prevention)
-- Optionally list your YouTube playlists (requires browser cookies)
-- Transcribe WhatsApp voice notes: convert `.opus` в†’ `.wav` with FFmpeg and transcribe with Whisper
+Windows-focused tooling around `yt-dlp`, FFmpeg, and a small amount of Python for transcription workflows.
 
 ---
 
@@ -51,57 +46,63 @@ A Windows-focused toolkit to:
   - FFmpeg (auto-installed into `ffmpeg_yt-dlp` by the helper script, used by the Python script)
   - Python packages: `openai-whisper` (and its dependencies, e.g. Torch)
 
----
+## yt-dlp Helper
+The helper now has a dedicated package structure under `yt-dlp-helper/`.
 
-## Setup
+Shared core:
+- `yt-dlp-helper/Helper.Core.ps1`
 
-### 1) Get your Firefox profile path (for cookies)
-If you want to list/download your own playlists:
-1. Run `yt-dlp-helper.ps1`.
-2. If no Firefox profile is saved yet, or the saved one no longer exists, the helper will scan your system for Firefox profiles and list them as choices.
-3. Pick one of the detected profiles, or choose the manual-entry option and paste the absolute profile folder path yourself.
-4. The selected path is saved in `yt-dlp-helper\user_preferences.json` for future runs.
+Entry points:
+- CLI: `yt-dlp-helper/yt-dlp-helper.ps1`
+- GUI: `yt-dlp-helper/yt-dlp-helper-gui.ps1`
 
-If you need to verify the path manually first, open Firefox and go to `about:profiles`, then copy the absolute folder path for the profile you use for YouTube logins.
-
-### 2) Allow running the script (if needed)
-If your execution policy blocks local scripts, run PowerShell as your user and execute:
+### Run the helper CLI
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+powershell -NoProfile -ExecutionPolicy Bypass -File .\yt-dlp-helper.ps1
 ```
 
----
-
-## Using the YouTube Helper
-
-1. Open PowerShell in the project folder:
+### Run the helper GUI
 ```powershell
-cd "C:\Users\<you>\Documents\GitHub\my-yt-dlp"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\yt-dlp-helper\yt-dlp-helper-gui.ps1
 ```
 
-2. Run the helper:
-```powershell
-./yt-dlp-helper.ps1
-```
+### Helper GUI workbench
+The helper GUI is task-oriented and non-blocking. Current task surfaces:
+- `Single Video`
+- `Playlist URL`
+- `My Playlists`
+- `Environment`
+- `Folder Inspector`
 
-3. On first run, it will:
-   - Check/download the latest shared `yt-dlp` nightly build into the repo root (`yt-dlp.exe`)
-   - Download a shared portable FFmpeg zip, extract it to `ffmpeg_yt-dlp/`, and pass `--ffmpeg-location` to `yt-dlp`
-   - Load/save helper preferences in `yt-dlp-helper\user_preferences.json`
+Long-running work runs in a background worker. The activity pane shows live stdout/stderr, current job state, cancel, and recent job history.
 
-4. Choose a menu option:
-   - 1: Download Single Video (best quality + metadata)
-   - 2: Download Playlist by URL (best quality + metadata)
-   - 3: List & Download My Playlists (requires Firefox cookies)
-   - 4: List & Download My Playlists (Force Refresh Cache)
+### Helper defaults and state
+- Helper preferences live in `yt-dlp-helper/user_preferences.json`
+- Playlist cache lives in `yt-dlp-helper/cache/playlists_cache.json`
+- GUI logs and per-job logs live under `yt-dlp-helper/logs/`
+- Default helper download root is `yt-dlp-helper/Downloads/`
+- The selected download root is remembered and can be changed from CLI or GUI
 
-### Download root and per-location preferences
-- On start, the helper now asks for a download root path. The choice is remembered.
-- Each download root keeps its own `user_preferences.json` and `download_archive.txt` inside that path, so you can maintain separate contexts for different drives/folders.
-- The helper-global `yt-dlp-helper\user_preferences.json` stores the last used download root, the current `yt-dlp` version, and the saved Firefox profile path.
+### Download layout
+- Single videos: `<download root>/Singles/%(title)s [%(id)s].%(ext)s`
+- Single-video duplicate tracking: `<download root>/Singles/download_archive.txt`
+- Playlist downloads: `<download root>/<Playlist Title> [<playlistId>]/`
+- Playlist duplicate tracking: `<playlist folder>/download_archive.txt`
+- Optional playlist sidecars: `<playlist folder>/_sidecar/`
+- Converted subtitle text files: `<playlist folder>/_sidecar/text/`
 
-### GUI logging configuration
-`yt-research-gui\yt-research-gui.ps1` reads logging settings from `yt-research-gui\yt-research-gui.config.json`:
+Main media downloads use the current helper preset, which embeds metadata and subtitles into the media output. Optional sidecar fetches collect `.info.json` and subtitle files into `_sidecar/`.
+
+### Folder Inspector
+The helper GUI includes an offline folder inspector for existing playlist folders. It reports only what local artifacts can prove or infer, including:
+- archive presence and entry count
+- playlist metadata file details when present
+- media, `.info.json`, subtitle, and transcript counts
+- inferred or confirmed playlist title and id
+- certainty states such as `Confirmed`, `Inferred`, and `Unknown`
+
+### Helper GUI logging config
+`yt-dlp-helper/yt-dlp-helper.gui.config.json` controls GUI logging:
 ```json
 {
   "logging": {
@@ -263,3 +264,5 @@ Notes:
 - Where is `yt-dlp.exe` stored? In the repo root as a shared tool for both the helper and the GUI, updated from the nightly builds.
 - How do I avoid re-downloading the same videos? The helper uses `--download-archive download_archive.txt` automatically. 
 
+## VS Code helpers
+This repo includes `.vscode/launch.json` and `.vscode/tasks.json` so the main tools can be started directly from VS Code without typing the launch commands each time.

@@ -10,6 +10,14 @@
       "createTemporaryIntegratedConsole": true
     },
     {
+      "name": "Launch yt-dlp helper GUI",
+      "type": "PowerShell",
+      "request": "launch",
+      "script": "${workspaceFolder}\\yt-dlp-helper\\yt-dlp-helper-gui.ps1",
+      "cwd": "${workspaceFolder}\\yt-dlp-helper",
+      "createTemporaryIntegratedConsole": true
+    },
+    {
       "name": "Launch yt-research GUI",
       "type": "PowerShell",
       "request": "launch",
